@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      5.3
-// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。v5.3 支持虚拟滚动列表的滚动采集。基于 table-500 类名精准提取 L1/L2/L3 类目文本。
+// @version      5.4
+// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。v5.4 使用持久化路径栈解决虚拟滚动下 L2/L3 被误判为 L1 的问题。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
@@ -327,40 +327,79 @@
         return null;
     }
 
-    // ==================== 路径构建（基于 --level）====================
+    // ==================== 路径构建（基于 --level，跨滚动轮次持久化）====================
 
     /**
-     * 使用 --level 层级栈构建路径
-     * Ozon 的 --level 是从 1 开始的整数，表示嵌套深度
+     * 持久化路径栈 —— 跨虚拟滚动轮次保持层级上下文
+     * 虚拟滚动会卸载已滚出的 DOM 节点（包括父级 L1），
+     * 如果每轮从空栈开始构建，L2/L3 就会丢失父级上下文。
+     * 此栈在所有操作间共享，确保即使 L1 不在当前视口内也能正确记录。
+     */
+    let pathStack = []; // [{level: number, name: string}]
+
+    /** 用一行数据更新持久化路径栈 */
+    function updatePersistentStack(rowInfo) {
+        const { level, name } = rowInfo;
+        if (!name || level < 0) return;
+
+        // 弹出 level >= 当前 level 的项（同级的下一个替换，或回退到更上层）
+        while (pathStack.length > 0 && pathStack[pathStack.length - 1].level >= level) {
+            pathStack.pop();
+        }
+        pathStack.push({ level, name });
+    }
+
+    /** 从持久化栈获取完整路径信息 */
+    function getPathFromStack(currentName) {
+        const parts = pathStack.map(s => s.name).filter(Boolean);
+        return {
+            path: parts.join(' > '),
+            l1: parts[0] || '',
+            l2: parts[1] || '',
+            l3: parts[2] || '',
+            name: currentName,
+            depth: parts.length,
+        };
+    }
+
+    /** 重置持久化栈（新扫描开始时调用） */
+    function resetPathStack() {
+        pathStack = [];
+    }
+
+    /**
+     * 同步持久化栈与当前可见行
+     * 按DOM顺序遍历所有可见行，更新栈状态
+     * 这样点击追踪时也能获得正确的跨滚动上下文
+     */
+    function syncStackWithVisibleRows(container) {
+        const rows = getAllCategoryRows(container);
+        for (const rowInfo of rows) {
+            if (rowInfo.name && rowInfo.level >= 0) {
+                updatePersistentStack(rowInfo);
+            }
+        }
+    }
+
+    /**
+     * 为单行构建路径信息（兼容旧接口）
+     * 现在直接使用持久化栈
      */
     function buildPathForRow(targetRowInfo, allRows) {
         const { name, level } = targetRowInfo;
         if (!name) return null;
 
-        // 用 level 构建栈
-        const stack = []; // [{level, name}]
-
+        // 先用 allRows 同步栈到目标行之前的状态
         for (const rowInfo of allRows) {
-            // 弹出比当前 level 大或等于的（因为同级的下一个应该替换）
-            while (stack.length > 0 && stack[stack.length - 1].level >= rowInfo.level) {
-                stack.pop();
-            }
-            stack.push({ level: rowInfo.level, name: rowInfo.name });
-
-            if (rowInfo === targetRowInfo) {
-                const pathParts = stack.map(s => s.name).filter(Boolean);
-                return {
-                    path: pathParts.join(' > '),
-                    l1: pathParts[0] || '',
-                    l2: pathParts[1] || '',
-                    l3: pathParts[2] || '',
-                    name: name,
-                    depth: pathParts.length,
-                };
+            if (rowInfo === targetRowInfo) break;
+            if (rowInfo.name && rowInfo.level >= 0) {
+                updatePersistentStack(rowInfo);
             }
         }
+        // 更新目标行本身
+        updatePersistentStack(targetRowInfo);
 
-        return { path: name, l1: name, l2: '', l3: '', name, depth: 1 };
+        return getPathFromStack(name);
     }
 
     // ==================== 全量扫描（虚拟滚动兼容）====================
@@ -390,6 +429,7 @@
 
         scanInProgress = true;
         clearAll();
+        resetPathStack(); // ← 关键：重置持久化栈
         updateStatus('正在扫描...');
 
         // 用 path 去重
@@ -416,8 +456,10 @@
                 let newInRound = 0;
 
                 for (const rowInfo of currentRows) {
-                    if (!rowInfo.name) continue;
-                    const info = buildPathForRow(rowInfo, currentRows);
+                    if (!rowInfo.name || rowInfo.level < 0) continue;
+                    // ← 关键：使用持久化栈更新层级上下文，不重置
+                    updatePersistentStack(rowInfo);
+                    const info = getPathFromStack(rowInfo.name);
                     if (info && !seenPaths.has(info.path)) {
                         seenPaths.add(info.path);
                         collectedData.push(info);
@@ -440,8 +482,9 @@
                         // 再采一轮底部内容
                         const finalRows = getAllCategoryRows(container);
                         for (const rowInfo of finalRows) {
-                            if (!rowInfo.name) continue;
-                            const info = buildPathForRow(rowInfo, finalRows);
+                            if (!rowInfo.name || rowInfo.level < 0) continue;
+                            updatePersistentStack(rowInfo);
+                            const info = getPathFromStack(rowInfo.name);
                             if (info && !seenPaths.has(info.path)) {
                                 seenPaths.add(info.path);
                                 collectedData.push(info);
@@ -461,8 +504,9 @@
             // ===== 普通列表：一次性采集 =====
             const rows = getAllCategoryRows(container);
             for (const rowInfo of rows) {
-                if (!rowInfo.name) continue;
-                const info = buildPathForRow(rowInfo, rows);
+                if (!rowInfo.name || rowInfo.level < 0) continue;
+                updatePersistentStack(rowInfo);
+                const info = getPathFromStack(rowInfo.name);
                 if (info && !seenPaths.has(info.path)) {
                     seenPaths.add(info.path);
                     collectedData.push(info);
@@ -499,10 +543,11 @@
             return;
         }
 
-        // 获取所有可见行来构建路径
-        const allRows = getAllCategoryRows(container);
-        const currentRowInfo = { element: row, button, level, name };
-        const info = buildPathForRow(currentRowInfo, allRows);
+        // 同步持久化栈到当前可见状态（按DOM顺序更新所有可见行）
+        syncStackWithVisibleRows(container);
+        // 再更新点击的这一行
+        updatePersistentStack({ level, name });
+        const info = getPathFromStack(name);
         if (!info) return;
 
         // 用 path 字符串去重/移除（不依赖 element 引用，避免 DOM 变化导致重复）
@@ -611,7 +656,7 @@
                 `| ${i + 1} | ${d.l1 || '-'} | ${d.l2 || '-'} | ${d.l3 || '-'} | ${d.name || '-'} |`
             ),
             '',
-            '*Generated by Ozon Category Collector v5.3*',
+            '*Generated by Ozon Category Collector v5.4*',
         ];
         const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
@@ -773,7 +818,7 @@
         const root = document.createElement('div');
         root.id = 'ozon-fab-root';
         root.innerHTML = `
-            <button id="ozon-fab" title="Ozon 类目采集器 v5.3">
+            <button id="ozon-fab" title="Ozon 类目采集器 v5.4">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
                 <span id="ozon-fab-badge"></span>
@@ -784,7 +829,7 @@
                     <div class="ozon-header-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>Ozon 类目采集器 v5.3</span>
+                        <span>Ozon 类目采集器 v5.4</span>
                     </div>
                     <button id="ozon-btn-collapse" title="收起">▾</button>
                 </div>
@@ -918,7 +963,7 @@
         // 启动
         startClickTracker();
         fab.classList.add('tracking');
-        log('Ozon 类目采集器 v5.3 加载完成');
+        log('Ozon 类目采集器 v5.4 加载完成');
     }
 
     function startClickTracker() {
