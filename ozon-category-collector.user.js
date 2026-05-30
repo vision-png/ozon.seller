@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  批量展开、采集 Ozon 卖家后台类目树，导出 CSV。使用前先点击「类目」按钮打开类目筛选弹窗/下拉框。
+// @version      1.1
+// @description  批量展开、采集 Ozon 卖家后台类目树，导出 CSV。FAB 悬浮按钮 + 展开式操作面板。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
@@ -534,189 +534,382 @@
         collectSelected();
     }
 
-    // ==================== UI 面板 ====================
+    // ==================== UI 面板（FAB + 展开式悬浮窗） ====================
 
     function updateStatus(text) {
         const el = document.getElementById('ozon-collector-status');
         if (el) el.textContent = text;
+        // 同步更新 FAB 徽标
+        const badge = document.getElementById('ozon-fab-badge');
+        if (badge) {
+            const match = text.match(/(\d+)\s*条/);
+            badge.textContent = match ? match[1] : '';
+            badge.style.display = match ? 'flex' : 'none';
+        }
     }
 
     function initUI() {
-        if (document.getElementById('ozon-category-collector')) return;
+        if (document.getElementById('ozon-fab-root')) return;
 
-        const panel = document.createElement('div');
-        panel.id = 'ozon-category-collector';
-        panel.innerHTML = `
-            <div id="ozon-collector-header">
-                <span>📂 Ozon 类目采集器</span>
-                <div style="display:flex;gap:6px;align-items:center;">
-                    <button id="ozon-collector-minimize" title="最小化">−</button>
-                    <button id="ozon-collector-close" title="关闭">×</button>
-                </div>
-            </div>
-            <div id="ozon-collector-body">
-                <div id="ozon-collector-buttons">
-                    <button id="ozon-btn-expand" title="递归展开所有类目节点">展开全部</button>
-                    <button id="ozon-btn-collect" title="采集当前勾选的类目">采集选中</button>
-                    <button id="ozon-btn-download" title="导出为 CSV 表格">下载 CSV</button>
-                </div>
-                <div id="ozon-collector-options">
-                    <label title="控制台输出详细匹配日志，用于排查问题">
-                        <input type="checkbox" id="ozon-debug-toggle"> 调试模式
-                    </label>
-                    <button id="ozon-btn-detect" style="margin-left:8px;padding:2px 8px;font-size:11px;border:1px solid #ddd;border-radius:4px;background:#fafafa;cursor:pointer;">检测树</button>
-                </div>
-                <div id="ozon-collector-status">就绪 — 请先打开「类目」筛选弹窗</div>
-                <div id="ozon-collector-results">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th style="width:30px;text-align:center;">#</th>
-                                <th>完整路径</th>
-                                <th style="width:45px;text-align:center;">深度</th>
-                                <th style="width:45px;text-align:center;">叶子</th>
-                            </tr>
-                        </thead>
-                        <tbody id="ozon-collector-tbody">
-                            <tr><td colspan="4" style="text-align:center;color:#999;padding:20px;">暂无数据</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-                <div style="margin-top:8px;font-size:11px;color:#999;text-align:center;">
-                    共 <span id="ozon-result-count">0</span> 条 · 点击表头可排序
-                </div>
-            </div>
-        `;
-
+        // ── 注入样式 ──
         const style = document.createElement('style');
         style.textContent = `
-            #ozon-category-collector {
+            /* ===== FAB 悬浮按钮 ===== */
+            #ozon-fab-root {
                 position: fixed;
-                bottom: 24px;
-                right: 24px;
-                width: 440px;
-                max-height: 620px;
-                background: #ffffff;
-                border-radius: 14px;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.08);
+                bottom: 32px;
+                right: 32px;
+                z-index: 2147483647;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
+            }
+
+            #ozon-fab {
+                width: 56px;
+                height: 56px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #005bff 0%, #003d99 100%);
+                border: none;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 4px 16px rgba(0,91,255,0.4), 0 2px 4px rgba(0,0,0,0.12);
+                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                position: relative;
+                outline: none;
+                color: #fff;
+            }
+            #ozon-fab:hover {
+                transform: scale(1.08);
+                box-shadow: 0 6px 24px rgba(0,91,255,0.5), 0 3px 6px rgba(0,0,0,0.15);
+            }
+            #ozon-fab:active {
+                transform: scale(0.95);
+            }
+            #ozon-fab.open {
+                border-radius: 16px;
+                width: 44px;
+                height: 44px;
+                background: linear-gradient(135deg, #e8eaed 0%, #dadce0 100%);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            }
+            #ozon-fab svg {
+                width: 26px;
+                height: 26px;
+                transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            #ozon-fab.open svg {
+                transform: rotate(90deg);
+                width: 20px;
+                height: 20px;
+                color: #5f6368;
+            }
+
+            /* FAB 脉冲动效 */
+            #ozon-fab::before {
+                content: '';
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                border-radius: 50%;
+                background: rgba(0, 91, 255, 0.3);
+                animation: ozon-fab-pulse 2.5s ease-in-out infinite;
+                z-index: -1;
+            }
+            #ozon-fab.open::before {
+                animation: none;
+                opacity: 0;
+            }
+            @keyframes ozon-fab-pulse {
+                0%, 100% { transform: scale(1); opacity: 0.4; }
+                50% { transform: scale(1.6); opacity: 0; }
+            }
+
+            /* FAB 徽标（显示采集数量） */
+            #ozon-fab-badge {
+                position: absolute;
+                top: -4px;
+                right: -4px;
+                min-width: 20px;
+                height: 20px;
+                padding: 0 6px;
+                border-radius: 10px;
+                background: #e37400;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 600;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 2px 4px rgba(227,116,0,0.3);
+                line-height: 1;
+            }
+
+            /* FAB 工具提示 */
+            #ozon-fab-tip {
+                position: absolute;
+                right: 68px;
+                top: 50%;
+                transform: translateY(-50%);
+                background: #323232;
+                color: #fff;
+                font-size: 13px;
+                padding: 6px 12px;
+                border-radius: 6px;
+                white-space: nowrap;
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.2s ease;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            }
+            #ozon-fab-tip::after {
+                content: '';
+                position: absolute;
+                right: -6px;
+                top: 50%;
+                transform: translateY(-50%) rotate(45deg);
+                width: 10px;
+                height: 10px;
+                background: #323232;
+            }
+            #ozon-fab:hover #ozon-fab-tip {
+                opacity: 1;
+            }
+
+            /* ===== 展开式面板 ===== */
+            #ozon-panel {
+                position: fixed;
+                bottom: 100px;
+                right: 32px;
+                width: 480px;
+                max-height: 560px;
+                background: #ffffff;
+                border-radius: 16px;
+                box-shadow: 0 12px 48px rgba(0,0,0,0.2), 0 4px 12px rgba(0,0,0,0.08);
                 font-size: 13px;
                 color: #333;
-                z-index: 2147483647;
+                z-index: 2147483646;
                 overflow: hidden;
                 display: flex;
                 flex-direction: column;
                 line-height: 1.5;
-                transition: transform 0.2s ease, opacity 0.2s ease;
+                transform-origin: bottom right;
+                transform: scale(0.4) translateY(20px);
+                opacity: 0;
+                pointer-events: none;
+                transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.25s ease;
             }
-            #ozon-category-collector.minimized #ozon-collector-body {
-                display: none !important;
+            #ozon-panel.visible {
+                transform: scale(1) translateY(0);
+                opacity: 1;
+                pointer-events: auto;
             }
-            #ozon-collector-header {
+
+            /* 面板头部 */
+            #ozon-panel-header {
                 background: linear-gradient(135deg, #005bff 0%, #003d99 100%);
                 color: #fff;
-                padding: 12px 16px;
+                padding: 14px 18px;
                 font-weight: 600;
-                font-size: 14px;
+                font-size: 15px;
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
                 cursor: move;
                 user-select: none;
                 flex-shrink: 0;
+                letter-spacing: 0.3px;
             }
-            #ozon-collector-header button {
+            #ozon-panel-header .ozon-header-title {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            #ozon-panel-header .ozon-header-actions {
+                display: flex;
+                gap: 6px;
+                align-items: center;
+            }
+            #ozon-panel-header button {
                 background: rgba(255,255,255,0.15);
                 border: none;
                 color: #fff;
-                font-size: 16px;
+                font-size: 15px;
                 cursor: pointer;
-                width: 26px;
-                height: 26px;
-                line-height: 26px;
+                width: 28px;
+                height: 28px;
+                line-height: 28px;
                 text-align: center;
-                border-radius: 6px;
+                border-radius: 8px;
                 padding: 0;
                 transition: background 0.15s;
             }
-            #ozon-collector-header button:hover {
+            #ozon-panel-header button:hover {
                 background: rgba(255,255,255,0.3);
             }
-            #ozon-collector-body {
-                padding: 14px 16px 16px;
+
+            /* 面板主体 */
+            #ozon-panel-body {
+                padding: 16px 18px 18px;
                 overflow-y: auto;
                 flex: 1;
                 min-height: 0;
             }
-            #ozon-collector-buttons {
+
+            /* 步骤指引 */
+            #ozon-steps {
                 display: flex;
-                gap: 8px;
-                margin-bottom: 10px;
+                gap: 6px;
+                margin-bottom: 14px;
+                padding: 10px 12px;
+                background: linear-gradient(135deg, #f0f6ff 0%, #e8f0fe 100%);
+                border-radius: 10px;
+                border: 1px solid #d2e3fc;
             }
-            #ozon-collector-buttons button {
+            .ozon-step {
                 flex: 1;
-                padding: 9px 6px;
-                border: none;
-                border-radius: 8px;
-                font-size: 13px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 12px;
+                color: #1967d2;
                 font-weight: 500;
+            }
+            .ozon-step-num {
+                width: 22px;
+                height: 22px;
+                border-radius: 50%;
+                background: #1967d2;
+                color: #fff;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 11px;
+                font-weight: 700;
+                flex-shrink: 0;
+            }
+            .ozon-step-arrow {
+                color: #a8c7fa;
+                font-size: 14px;
+                flex-shrink: 0;
+            }
+
+            /* 操作按钮 */
+            #ozon-panel-buttons {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 14px;
+            }
+            #ozon-panel-buttons button {
+                flex: 1;
+                padding: 10px 8px;
+                border: none;
+                border-radius: 10px;
+                font-size: 14px;
+                font-weight: 600;
                 cursor: pointer;
                 transition: all 0.15s ease;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 6px;
             }
-            #ozon-collector-buttons button:active {
+            #ozon-panel-buttons button:active {
                 transform: scale(0.97);
             }
             #ozon-btn-expand {
-                background: #e8f0fe;
+                background: linear-gradient(135deg, #e8f0fe 0%, #d2e3fc 100%);
                 color: #1967d2;
+                border: 1px solid #a8c7fa !important;
             }
             #ozon-btn-expand:hover {
-                background: #d2e3fc;
+                background: linear-gradient(135deg, #d2e3fc 0%, #aecbfa 100%);
+                box-shadow: 0 2px 8px rgba(25,103,210,0.15);
             }
             #ozon-btn-collect {
-                background: #e6f4ea;
+                background: linear-gradient(135deg, #e6f4ea 0%, #ceead6 100%);
                 color: #1e8e3e;
+                border: 1px solid #a8dab5 !important;
             }
             #ozon-btn-collect:hover {
-                background: #ceead6;
+                background: linear-gradient(135deg, #ceead6 0%, #b7e1c7 100%);
+                box-shadow: 0 2px 8px rgba(30,142,62,0.15);
             }
             #ozon-btn-download {
-                background: #fef3e8;
+                background: linear-gradient(135deg, #fef3e8 0%, #fce8cc 100%);
                 color: #e37400;
+                border: 1px solid #f5c88a !important;
             }
             #ozon-btn-download:hover {
-                background: #fce8cc;
+                background: linear-gradient(135deg, #fce8cc 0%, #fad9a8 100%);
+                box-shadow: 0 2px 8px rgba(227,116,0,0.15);
             }
-            #ozon-collector-options {
+
+            /* 选项栏 */
+            #ozon-panel-options {
                 display: flex;
                 align-items: center;
-                margin-bottom: 8px;
+                justify-content: space-between;
+                margin-bottom: 10px;
+                padding: 6px 0;
+                border-top: 1px solid #f1f3f4;
+                border-bottom: 1px solid #f1f3f4;
+            }
+            #ozon-panel-options label {
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 5px;
                 font-size: 12px;
                 color: #666;
             }
-            #ozon-collector-options input[type="checkbox"] {
-                margin-right: 4px;
+            #ozon-panel-options input[type="checkbox"] {
                 cursor: pointer;
+                accent-color: #005bff;
             }
-            #ozon-collector-options label {
+            #ozon-btn-detect {
+                padding: 4px 12px;
+                font-size: 11px;
+                border: 1px solid #dadce0;
+                border-radius: 6px;
+                background: #f8f9fa;
                 cursor: pointer;
-                display: flex;
-                align-items: center;
+                color: #5f6368;
+                transition: all 0.15s;
             }
+            #ozon-btn-detect:hover {
+                background: #e8eaed;
+                border-color: #dadce0;
+            }
+
+            /* 状态栏 */
             #ozon-collector-status {
                 font-size: 12px;
-                color: #666;
-                margin-bottom: 10px;
-                padding: 6px 10px;
+                color: #5f6368;
+                margin-bottom: 12px;
+                padding: 8px 12px;
                 background: #f8f9fa;
-                border-radius: 6px;
+                border-radius: 8px;
                 border-left: 3px solid #005bff;
+                transition: border-left-color 0.3s;
             }
+            #ozon-collector-status.status-ok {
+                border-left-color: #34a853;
+                background: #f0faf0;
+                color: #1e8e3e;
+            }
+            #ozon-collector-status.status-warn {
+                border-left-color: #e37400;
+                background: #fef8f0;
+                color: #e37400;
+            }
+
+            /* 结果表格 */
             #ozon-collector-results {
-                max-height: 280px;
+                max-height: 240px;
                 overflow-y: auto;
                 border: 1px solid #e8eaed;
-                border-radius: 8px;
+                border-radius: 10px;
                 background: #fafbfc;
             }
             #ozon-collector-results table {
@@ -726,7 +919,7 @@
             }
             #ozon-collector-results th,
             #ozon-collector-results td {
-                padding: 7px 8px;
+                padding: 8px 10px;
                 text-align: left;
                 border-bottom: 1px solid #e8eaed;
                 white-space: nowrap;
@@ -740,6 +933,7 @@
                 font-size: 11px;
                 text-transform: uppercase;
                 letter-spacing: 0.3px;
+                z-index: 1;
             }
             #ozon-collector-results tr:last-child td {
                 border-bottom: none;
@@ -750,37 +944,152 @@
             #ozon-collector-results td:nth-child(2) {
                 white-space: normal;
                 word-break: break-all;
-                max-width: 260px;
+                max-width: 280px;
+            }
+
+            /* 结果计数 */
+            #ozon-result-bar {
+                margin-top: 10px;
+                font-size: 11px;
+                color: #999;
+                text-align: center;
             }
         `;
 
         document.head.appendChild(style);
-        document.body.appendChild(panel);
 
-        // ── 事件绑定 ──
+        // ── 创建 FAB + 面板 DOM ──
+        const root = document.createElement('div');
+        root.id = 'ozon-fab-root';
+        root.innerHTML = `
+            <!-- FAB 按钮 -->
+            <button id="ozon-fab" title="Ozon 类目采集器">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7h16M4 12h16M4 17h10"/>
+                </svg>
+                <span id="ozon-fab-badge"></span>
+                <span id="ozon-fab-tip">类目采集器</span>
+            </button>
+
+            <!-- 展开面板 -->
+            <div id="ozon-panel">
+                <div id="ozon-panel-header">
+                    <div class="ozon-header-title">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                        </svg>
+                        <span>Ozon 类目采集器</span>
+                    </div>
+                    <div class="ozon-header-actions">
+                        <button id="ozon-btn-collapse" title="收起面板">▾</button>
+                    </div>
+                </div>
+                <div id="ozon-panel-body">
+                    <div id="ozon-steps">
+                        <div class="ozon-step"><span class="ozon-step-num">1</span>展开全部</div>
+                        <span class="ozon-step-arrow">›</span>
+                        <div class="ozon-step"><span class="ozon-step-num">2</span>勾选类目</div>
+                        <span class="ozon-step-arrow">›</span>
+                        <div class="ozon-step"><span class="ozon-step-num">3</span>采集导出</div>
+                    </div>
+                    <div id="ozon-panel-buttons">
+                        <button id="ozon-btn-expand" title="递归展开所有类目节点">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
+                            展开全部
+                        </button>
+                        <button id="ozon-btn-collect" title="采集当前勾选的类目">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                            采集选中
+                        </button>
+                        <button id="ozon-btn-download" title="导出为 CSV 表格">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                            下载 CSV
+                        </button>
+                    </div>
+                    <div id="ozon-panel-options">
+                        <label title="控制台输出详细匹配日志，用于排查问题">
+                            <input type="checkbox" id="ozon-debug-toggle"> 调试模式
+                        </label>
+                        <button id="ozon-btn-detect">检测树</button>
+                    </div>
+                    <div id="ozon-collector-status">就绪 — 请先打开「类目」筛选弹窗</div>
+                    <div id="ozon-collector-results">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th style="width:30px;text-align:center;">#</th>
+                                    <th>完整路径</th>
+                                    <th style="width:50px;text-align:center;">深度</th>
+                                    <th style="width:50px;text-align:center;">叶子</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ozon-collector-tbody">
+                                <tr><td colspan="4" style="text-align:center;color:#999;padding:20px;">暂无数据</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div id="ozon-result-bar">共 <span id="ozon-result-count">0</span> 条</div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(root);
+
+        // ── 元素引用 ──
+        const fab = document.getElementById('ozon-fab');
+        const panel = document.getElementById('ozon-panel');
+        let panelOpen = false;
+
+        // ── FAB 点击展开/收起 ──
+        fab.addEventListener('click', () => {
+            panelOpen = !panelOpen;
+            panel.classList.toggle('visible', panelOpen);
+            fab.classList.toggle('open', panelOpen);
+            // 更新图标：展开时显示关闭 X
+            fab.innerHTML = panelOpen
+                ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                   <span id="ozon-fab-badge"></span>`
+                : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+                   <span id="ozon-fab-badge"></span>
+                   <span id="ozon-fab-tip">类目采集器</span>`;
+            updateStatus(document.getElementById('ozon-collector-status')?.textContent || '');
+        });
+
+        // 面板内收起按钮
+        document.getElementById('ozon-btn-collapse').onclick = () => {
+            panelOpen = false;
+            panel.classList.remove('visible');
+            fab.classList.remove('open');
+            fab.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+               <span id="ozon-fab-badge"></span>
+               <span id="ozon-fab-tip">类目采集器</span>`;
+        };
+
+        // ── 操作按钮事件 ──
         document.getElementById('ozon-btn-expand').onclick = expandAll;
         document.getElementById('ozon-btn-collect').onclick = collectSelected;
         document.getElementById('ozon-btn-download').onclick = downloadCSV;
-        document.getElementById('ozon-collector-close').onclick = () => panel.remove();
-        document.getElementById('ozon-collector-minimize').onclick = () => panel.classList.toggle('minimized');
         document.getElementById('ozon-debug-toggle').onchange = (e) => {
             CONFIG.debug = e.target.checked;
             log('调试模式:', CONFIG.debug ? '已开启' : '已关闭');
         };
         document.getElementById('ozon-btn-detect').onclick = () => {
             const c = findTreeContainer();
+            const status = document.getElementById('ozon-collector-status');
             if (c) {
-                updateStatus('已检测到类目树 ✓');
+                status.textContent = '已检测到类目树 ✓';
+                status.className = 'status-ok';
                 log('手动检测成功:', c);
             } else {
-                updateStatus('未检测到类目树 ✗ — 请确保弹窗已打开');
+                status.textContent = '未检测到类目树 ✗ — 请确保弹窗已打开';
+                status.className = 'status-warn';
                 log('手动检测失败');
             }
         };
 
-        // ── 拖拽 ──
+        // ── 面板拖拽 ──
         let dragging = false, offset = { x: 0, y: 0 };
-        const header = document.getElementById('ozon-collector-header');
+        const header = document.getElementById('ozon-panel-header');
 
         header.addEventListener('mousedown', (e) => {
             if (e.target.tagName === 'BUTTON') return;
@@ -805,11 +1114,12 @@
             const c = findTreeContainer();
             const status = document.getElementById('ozon-collector-status');
             if (c && status && status.textContent.includes('请先打开')) {
-                updateStatus('就绪 — 已检测到类目树 ✓');
+                status.textContent = '就绪 — 已检测到类目树 ✓';
+                status.className = 'status-ok';
             }
         }, 1500);
 
-        log('Ozon 类目采集器已加载 v1.0');
+        log('Ozon 类目采集器已加载 v1.1 (FAB 悬浮窗模式)');
     }
 
     // ==================== 启动 ====================
