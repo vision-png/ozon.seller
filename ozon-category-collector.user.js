@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      5.0
-// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。精准识别 --level CSS 变量层级、li 行元素、button 内文本。支持点击采集 + 一键全量扫描。
+// @version      5.1
+// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。v5.1 修复三级类目提取、去重逻辑、跨行匹配问题。支持点击采集 + 一键全量扫描。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
@@ -242,9 +242,10 @@
                 const tag = child.tagName.toLowerCase();
                 const cls = child.className || '';
 
-                // 跳过明显的非文本元素
+                // 跳过明显的非文本元素（只在当前元素层面判断，不用 querySelector 查后代）
                 if (tag === 'svg' || tag === 'button' || tag === 'input') continue;
-                if (cls.includes('checkbox') || cls.includes('check') || child.querySelector('svg')) continue;
+                // 只跳过 className 中明确含 checkbox 的容器元素，不因为后代有 svg 就跳过
+                if (cls.includes('checkbox') || cls.includes('check')) continue;
                 if (child.getAttribute('role') === 'checkbox') continue;
 
                 // 直接检查文本
@@ -283,19 +284,15 @@
         return '';
     }
 
-    /** 获取干净的文本内容（只取直接文本节点） */
+    /** 获取元素及其所有后代中的纯文本内容（递归所有元素类型） */
     function getTextContentClean(el) {
         let text = '';
         for (const node of Array.from(el.childNodes)) {
             if (node.nodeType === 3) { // 文本节点
                 text += node.textContent.trim() + ' ';
-            } else if (node.nodeType === 1) { // 元素节点
-                // 只对简单的 inline 元素递归
-                const tag = node.tagName.toLowerCase();
-                if (['span', 'b', 'i', 'strong', 'em', 'small'].includes(tag)) {
-                    const sub = getTextContentClean(node);
-                    if (sub) text += sub + ' ';
-                }
+            } else if (node.nodeType === 1) { // 元素节点 — 递归所有类型
+                const sub = getTextContentClean(node);
+                if (sub) text += sub + ' ';
             }
         }
         return text.trim();
@@ -303,23 +300,21 @@
 
     /**
      * 从点击目标找到对应的类目行
+     * 只向上遍历祖先链，检查当前元素本身是否是 --level button
+     * 避免 querySelector 跨行匹配到错误的 button
      */
     function findRowFromTarget(target, container) {
         let el = target;
         for (let i = 0; i < 15; i++) {
             if (!el || el === document.body || el === container) break;
 
-            // 检查是否就是行本身或行的子元素
-            const btn = el.tagName === 'BUTTON' && el.getAttribute('style')?.includes('--level')
-                ? el : el.querySelector('button[style*="--level"]');
-            if (btn) {
-                const row = btn.closest('li') || el;
-                return { row, button: btn };
+            // 当前元素本身就是 --level button
+            if (el.tagName === 'BUTTON' && el.getAttribute('style')?.includes('--level')) {
+                const row = el.closest('li') || el.parentElement;
+                const level = getLevelFromStyle(el);
+                const name = extractNameFromButton(el);
+                return { element: row, button: el, level, name };
             }
-
-            // 检查是否在已知行内
-            const inRow = getAllCategoryRows(container).find(r => r.element.contains(el));
-            if (inRow) return inRow;
 
             el = el.parentElement;
         }
@@ -380,12 +375,13 @@
         // 清空旧数据
         clearAll();
 
-        // 收集所有行
+        // 收集所有行（按 path 去重）
+        const seenPaths = new Set();
         for (const rowInfo of rows) {
             if (!rowInfo.name) continue;
             const info = buildPathForRow(rowInfo, rows);
-            if (info) {
-                trackedElements.set(rowInfo.element, info);
+            if (info && !seenPaths.has(info.path)) {
+                seenPaths.add(info.path);
                 collectedData.push(info);
             }
         }
@@ -411,10 +407,7 @@
             return;
         }
 
-        const { row, button } = found;
-        const level = getLevelFromStyle(button);
-        const name = extractNameFromButton(button);
-
+        const { element: row, button, level, name } = found;
         if (!name) {
             debug('无法提取类目名称:', button.outerHTML.substring(0, 200));
             return;
@@ -422,28 +415,20 @@
 
         // 获取所有可见行来构建路径
         const allRows = getAllCategoryRows(container);
-
-        // 在现有 allRows 中找当前这一条
-        const currentRowInfo = allRows.find(r => r.element === row) ||
-                               { element: row, button, level, name };
-
+        const currentRowInfo = { element: row, button, level, name };
         const info = buildPathForRow(currentRowInfo, allRows);
         if (!info) return;
 
-        // 切换追踪状态
-        if (trackedElements.has(row)) {
-            trackedElements.delete(row);
-            collectedData = collectedData.filter(d => d.path !== info.path);
+        // 用 path 字符串去重/移除（不依赖 element 引用，避免 DOM 变化导致重复）
+        const existingIndex = collectedData.findIndex(d => d.path === info.path);
+        if (existingIndex >= 0) {
+            collectedData.splice(existingIndex, 1);
             flashRow(row, '#d93025');
-            debug('取消追踪:', info.name);
+            debug('取消追踪:', info.name, info.path);
         } else {
-            const exists = collectedData.some(d => d.path === info.path);
-            if (!exists) {
-                trackedElements.set(row, info);
-                collectedData.push(info);
-                flashRow(row, '#34a853');
-                debug('追踪:', info.name, '(L' + info.depth + ')', info.path);
-            }
+            collectedData.push(info);
+            flashRow(row, '#34a853');
+            debug('追踪:', info.name, '(L' + info.depth + ')', info.path);
         }
 
         updateStatus(`已追踪 ${collectedData.length} 条类目`);
@@ -622,7 +607,7 @@
             #ozon-fab:hover #ozon-fab-tip { opacity:1; }
 
             /* 面板 */
-            #ozon-panel { position: fixed; bottom: 100px; right: 32px; width: 600px; max-height: 660px;
+            #ozon-panel { position: fixed; bottom: 100px; right: 32px; width: 720px; max-height: 660px;
                 background: #fff; border-radius: 16px;
                 box-shadow: 0 12px 48px rgba(0,0,0,0.2), 0 4px 12px rgba(0,0,0,0.08);
                 font-size: 13px; color: #333; z-index: 2147483646;
@@ -690,7 +675,7 @@
                 color: #5f6368; font-size: 11px; text-transform: uppercase; letter-spacing: 0.3px; z-index: 1; }
             #ozon-collector-results tr:last-child td { border-bottom: none; }
             #ozon-collector-results tr:hover td { background: #e8f0fe; }
-            #ozon-collector-results td:nth-child(n+2):nth-last-child(n+2) { white-space: normal; word-break: break-all; max-width: 130px; }
+            #ozon-collector-results td:nth-child(n+2):nth-last-child(n+2) { white-space: normal; word-break: break-word; max-width: 180px; }
             .ozon-remove-btn { transition: all 0.15s; }
             .ozon-remove-btn:hover { background: #d93025 !important; color: #fff !important; border-color: #d93025 !important; }
 
@@ -702,7 +687,7 @@
         const root = document.createElement('div');
         root.id = 'ozon-fab-root';
         root.innerHTML = `
-            <button id="ozon-fab" title="Ozon 类目采集器 v5.0">
+            <button id="ozon-fab" title="Ozon 类目采集器 v5.1">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
                 <span id="ozon-fab-badge"></span>
@@ -713,7 +698,7 @@
                     <div class="ozon-header-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>Ozon 类目采集器 v5.0</span>
+                        <span>Ozon 类目采集器 v5.1</span>
                     </div>
                     <button id="ozon-btn-collapse" title="收起">▾</button>
                 </div>
@@ -847,7 +832,7 @@
         // 启动
         startClickTracker();
         fab.classList.add('tracking');
-        log('Ozon 类目采集器 v5.0 加载完成（基于 --level DOM 结构）');
+        log('Ozon 类目采集器 v5.1 加载完成');
     }
 
     function startClickTracker() {
