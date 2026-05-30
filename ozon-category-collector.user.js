@@ -1,11 +1,16 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  批量采集 Ozon 卖家后台类目。支持两种模式：①点击追踪（你点什么记什么）②全量扫描（一键抓取当前页面所有可见类目）。FAB 悬浮按钮 + 展开式面板。
+// @version      3.0
+// @description  批量采集 Ozon 卖家后台类目。三种模式：①智能展开（点击展开按钮自动递归展开并采集整棵树）②手动追踪（点哪记哪）③全量扫描（一键抓取当前可见类目）。FAB 悬浮按钮 + 展开式面板。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
+// @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/vision-png/ozon.seller/main/ozon-category-collector.user.js
+// @downloadURL  https://raw.githubusercontent.com/vision-png/ozon.seller/main/ozon-category-collector.user.js
+// @supportURL   https://github.com/vision-png/ozon.seller/issues
+// @license      MIT
 // ==/UserScript==
 
 (function() {
@@ -14,22 +19,24 @@
     // ==================== 配置 ====================
     const CONFIG = {
         maxExpandRounds: 80,
-        expandDelay: 250,
+        expandDelay: 350,        // 展开后等待 DOM 更新的时间
         stableThreshold: 3,
         scrollStep: 800,
         debug: false,
-        // 点击追踪：需要延迟读取 DOM 才能拿到更新后的状态
         clickReadDelay: 150,
+        smartExpandTimeout: 60000, // 智能展开最大耗时
     };
 
     // ==================== 状态 ====================
     let collectedData = [];       // [{path, depth, name}]
     let trackedElements = new Map(); // element -> {path, name, depth}
     let isExpanding = false;
+    let isSmartExpanding = false; // 智能展开进行中
     let autoDetectTimer = null;
-    let clickTrackerActive = false; // 点击追踪模式是否启用
-    let currentMode = 'click';     // 'click' | 'scan'
-    let treeContainerRef = null;    // 当前检测到的树容器
+    let clickTrackerActive = false;
+    let currentMode = 'smart';    // 'smart' | 'click' | 'scan'
+    let treeContainerRef = null;
+    let smartExpandAbort = false; // 中止智能展开
 
     // ==================== 工具函数 ====================
     function log(...args) {
@@ -49,12 +56,7 @@
 
     // ==================== DOM 查找 ====================
 
-    /**
-     * 查找类目树/列表容器
-     * 多策略兜底，逐步放宽
-     */
     function findTreeContainer() {
-        // 策略1：语义选择器
         const semanticSelectors = [
             '[data-testid*="category"][data-testid*="tree"]',
             '[data-testid*="category-tree"]',
@@ -70,7 +72,6 @@
             if (el) { debug('✓ 树容器 (语义):', sel); return el; }
         }
 
-        // 策略2：智能评分
         const candidates = document.querySelectorAll('div, ul, ol');
         let best = null, bestScore = 0;
 
@@ -82,12 +83,10 @@
             score += el.querySelectorAll('input[type="checkbox"], [role="checkbox"]').length * 5;
             score += el.querySelectorAll('[aria-checked], [aria-expanded]').length * 4;
             score += el.querySelectorAll('svg').length * 0.5;
-            // Ozon 特征：包含「应用」按钮的区域很可能是下拉面板
             const text = el.textContent || '';
             if (/Применить|Очистить|应用|清除|Apply|Clear/i.test(text)) score += 10;
             if (/Категории|Категория|类目|Category/i.test(text)) score += 8;
 
-            // 文本节点数
             const spans = el.querySelectorAll('span, div');
             let textCount = 0;
             spans.forEach(n => {
@@ -108,7 +107,6 @@
 
         if (best) { debug('✓ 树容器 (评分):', bestScore.toFixed(1)); return best; }
 
-        // 策略3：Ozon 面板特征
         const allDivs = document.querySelectorAll('div');
         for (const div of allDivs) {
             const text = div.textContent.trim();
@@ -123,7 +121,6 @@
             }
         }
 
-        // 策略4：弹窗/下拉
         const overlays = document.querySelectorAll([
             '[class*="modal" i] [class*="content" i]:not([class*="modal-overlay" i])',
             '[class*="dropdown" i] [class*="menu" i]',
@@ -143,7 +140,85 @@
     }
 
     /**
-     * 在容器内查找所有可展开的节点
+     * 查找一行内的展开/折叠按钮
+     */
+    function findRowExpander(rowEl) {
+        if (!rowEl) return null;
+
+        // 策略1：找 aria-expanded 的元素
+        const ariaEl = rowEl.querySelector('[aria-expanded]');
+        if (ariaEl) return ariaEl;
+
+        // 策略2：找展开相关 class
+        const expanders = rowEl.querySelectorAll([
+            '[class*="expand" i]',
+            '[class*="toggle" i]',
+            '[class*="arrow" i]',
+            '[class*="chevron" i]',
+            '[class*="collapse" i]',
+        ].join(','));
+        for (const el of expanders) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && rect.width < 40 && rect.height < 40) {
+                return el;
+            }
+        }
+
+        // 策略3：找小 SVG（通常在行左侧）
+        const rowRect = rowEl.getBoundingClientRect();
+        const svgs = rowEl.querySelectorAll('svg');
+        for (const svg of svgs) {
+            const rect = svg.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && rect.width < 30 && rect.height < 30) {
+                const relativeX = rect.left - rowRect.left;
+                if (relativeX < 80) { // 左侧区域才可能是展开按钮
+                    return svg;
+                }
+            }
+        }
+
+        // 策略4：找 button（排除 checkbox 按钮）
+        const buttons = rowEl.querySelectorAll('button');
+        for (const btn of buttons) {
+            const rect = btn.getBoundingClientRect();
+            if (rect.width < 40 && rect.height < 40) {
+                const relativeX = rect.left - rowRect.left;
+                if (relativeX < 80) return btn;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * 判断一行是否已经展开
+     */
+    function isRowExpanded(rowEl, container) {
+        const expander = findRowExpander(rowEl);
+        if (expander) {
+            const aria = expander.getAttribute('aria-expanded');
+            if (aria === 'true') return true;
+            if (aria === 'false') return false;
+        }
+
+        // 通过子节点存在性判断
+        const allRows = getAllVisibleRows(container);
+        const idx = allRows.indexOf(rowEl);
+        if (idx === -1 || idx >= allRows.length - 1) return false;
+
+        const parentIndent = getIndent(rowEl);
+        const nextRow = allRows[idx + 1];
+        if (nextRow) {
+            const nextIndent = getIndent(nextRow);
+            const nextName = extractRowName(nextRow);
+            if (nextName && nextIndent > parentIndent) return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 查找容器内所有已折叠的展开按钮
      */
     function findCollapsedExpanders(container) {
         if (!container) return [];
@@ -165,7 +240,6 @@
             });
         });
 
-        // 小箭头 SVG
         container.querySelectorAll('svg').forEach(svg => {
             const rect = svg.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0 && rect.width < 30 && rect.height < 30) {
@@ -188,18 +262,13 @@
         return [...new Set(result)];
     }
 
-    // ==================== 核心功能 ====================
+    // ==================== 数据提取 ====================
 
-    /**
-     * 从一个「行」元素提取类目名
-     * 策略：找可见的最宽文本块（类目名通常占最多空间）
-     */
     function extractRowName(rowEl) {
         if (!rowEl) return '';
         const candidates = [];
 
         rowEl.querySelectorAll('span, div, p, label, a').forEach(el => {
-            // 只要叶子文本
             const hasTextChild = Array.from(el.children).some(c => {
                 const t = c.textContent.trim();
                 return t.length > 0 && c.getBoundingClientRect().height > 0;
@@ -223,33 +292,24 @@
             }
         }
 
-        // 兜底：直接取行文本，过滤掉明显非类目名的部分
         const allText = rowEl.textContent.trim();
         const lines = allText.split('\n').map(l => l.trim()).filter(l => l.length > 1 && l.length < 100);
         for (const line of lines) {
-            if (/[\u4e00-\u9fa5a-zA-Zа-яА-ЯЁё]/.test(line) && !/^\d+$/.test(line)) return line;
+            if (/[\u4e00-\u9fa5a-zA-Zа-яА-ЯЁё]/.test(line) && /^\d+$/.test(line)) return line;
         }
         return '';
     }
 
-    /**
-     * 获取元素的缩进值
-     */
     function getIndent(el) {
         if (!el) return 0;
         const s = window.getComputedStyle(el);
         return (parseFloat(s.paddingLeft) || 0) + (parseFloat(s.marginLeft) || 0);
     }
 
-    /**
-     * 从容器中提取所有可见的「行」
-     * 排除按钮栏、标题栏等非数据行
-     */
     function getAllVisibleRows(container) {
         const rows = [];
         const excluded = /Применить|Очистить|应用|清除|Apply|Clear|选择|Выбрать|Категории|搜索|Search|Найти/i;
 
-        // 先尝试直接子元素
         for (const child of container.children) {
             const rect = child.getBoundingClientRect();
             const text = child.textContent.trim();
@@ -259,7 +319,6 @@
             }
         }
 
-        // 如果太少，尝试孙元素
         if (rows.length < 3) {
             for (const child of container.children) {
                 for (const gc of child.children) {
@@ -277,7 +336,7 @@
     }
 
     /**
-     * 从一行元素构建完整路径（通过缩进推断层级）
+     * 通过缩进栈构建行的完整路径
      */
     function buildRowPath(targetRow, allRows) {
         const name = extractRowName(targetRow);
@@ -289,13 +348,14 @@
         for (const row of allRows) {
             const indent = getIndent(row);
             const rName = extractRowName(row);
+            if (!rName) continue;
 
             while (stack.length > 0 && indent <= stack[stack.length - 1].indent) {
                 stack.pop();
             }
             stack.push({ indent, name: rName });
 
-            if (row === targetRow || targetRow.contains(row) || row.contains(targetRow)) {
+            if (row === targetRow) {
                 const pathParts = stack.map(s => s.name).filter(Boolean);
                 return {
                     path: pathParts.join(' > '),
@@ -309,7 +369,42 @@
     }
 
     /**
-     * 找到被点击元素对应的「行」容器
+     * 查找某一行的直接子行
+     */
+    function findChildRows(parentRow, allRows) {
+        const parentIdx = allRows.indexOf(parentRow);
+        if (parentIdx === -1) return [];
+
+        const parentIndent = getIndent(parentRow);
+        const children = [];
+        let childIndent = null;
+
+        for (let i = parentIdx + 1; i < allRows.length; i++) {
+            const row = allRows[i];
+            const indent = getIndent(row);
+            const name = extractRowName(row);
+
+            if (!name) continue;
+
+            if (indent <= parentIndent) {
+                break; // 遇到同级或更高级节点
+            }
+
+            if (childIndent === null) {
+                childIndent = indent; // 记录第一个子节点的缩进
+            }
+
+            if (indent === childIndent) {
+                children.push(row);
+            }
+            // indent > childIndent 的是孙节点，跳过
+        }
+
+        return children;
+    }
+
+    /**
+     * 找到被点击元素对应的行容器
      */
     function findClickedRow(clickedEl, container) {
         let current = clickedEl;
@@ -317,7 +412,6 @@
             if (!current || current === container || current === document.body) return null;
             const parent = current.parentElement;
             if (parent && parent !== container && parent.children.length > 1) {
-                // 检查父级是否是一个合理的行
                 const pRect = parent.getBoundingClientRect();
                 if (pRect.width > 60 && pRect.height > 16 && pRect.height < 200) {
                     return parent;
@@ -328,7 +422,128 @@
         return current;
     }
 
-    // ==================== 展开全部 ====================
+    // ==================== 数据采集 ====================
+
+    function addCollectedData(item) {
+        if (!item.name || item.name === '未知') return;
+        // 去重
+        const exists = collectedData.some(d => d.path === item.path);
+        if (!exists) {
+            collectedData.push(item);
+        }
+    }
+
+    // ==================== 智能展开采集（v3.0 核心）====================
+
+    async function smartExpandAndCollect(startRow, container, visited = new Set()) {
+        if (!startRow || visited.has(startRow)) return;
+        if (smartExpandAbort) return;
+
+        visited.add(startRow);
+
+        // 先采集当前行
+        const allRows = getAllVisibleRows(container);
+        const { path, depth, name } = buildRowPath(startRow, allRows);
+        if (name && name !== '未知') {
+            addCollectedData({ path, depth, name });
+            trackedElements.set(startRow, { path, name, depth });
+        }
+
+        // 查找展开按钮
+        const expander = findRowExpander(startRow);
+        if (!expander) {
+            debug('叶子节点:', name);
+            return;
+        }
+
+        // 检查是否已展开
+        const alreadyExpanded = isRowExpanded(startRow, container);
+
+        if (!alreadyExpanded) {
+            // 需要展开
+            debug('展开节点:', name);
+            try {
+                expander.scrollIntoView({ block: 'center', behavior: 'instant' });
+                expander.click();
+            } catch (e) {
+                debug('展开点击失败:', e);
+            }
+
+            // 等待子节点加载（最多等待 3 秒）
+            let prevChildCount = 0;
+            let stableRounds = 0;
+            for (let i = 0; i < 15; i++) {
+                await sleep(200);
+                if (smartExpandAbort) return;
+
+                const currentRows = getAllVisibleRows(container);
+                const children = findChildRows(startRow, currentRows);
+
+                if (children.length === prevChildCount) {
+                    stableRounds++;
+                    if (stableRounds >= 2) break;
+                } else {
+                    stableRounds = 0;
+                    prevChildCount = children.length;
+                }
+            }
+        } else {
+            debug('节点已展开:', name);
+        }
+
+        // 获取展开后的子节点
+        if (smartExpandAbort) return;
+        const currentRows = getAllVisibleRows(container);
+        const childRows = findChildRows(startRow, currentRows);
+
+        debug('子节点:', childRows.length, '个 ←', name);
+
+        // 递归展开每个子节点
+        for (const child of childRows) {
+            if (smartExpandAbort) return;
+            await smartExpandAndCollect(child, container, visited);
+        }
+    }
+
+    async function runSmartExpandFromClick(targetRow, container) {
+        if (isSmartExpanding) {
+            alert('智能展开采集中，请稍候...');
+            return;
+        }
+
+        isSmartExpanding = true;
+        smartExpandAbort = false;
+        updateStatus('智能展开采集中...');
+
+        // 在面板上显示中止按钮
+        showAbortButton();
+
+        const startTime = Date.now();
+        const visited = new Set();
+
+        try {
+            await smartExpandAndCollect(targetRow, container, visited);
+        } catch (e) {
+            debug('智能展开异常:', e);
+        }
+
+        isSmartExpanding = false;
+        hideAbortButton();
+
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        updateStatus(`智能展开完成 ✓ ${collectedData.length} 条 (${elapsed}秒)`);
+        renderResults();
+        log('智能展开完成:', collectedData.length, '条, 耗时', elapsed, '秒');
+    }
+
+    function abortSmartExpand() {
+        smartExpandAbort = true;
+        isSmartExpanding = false;
+        hideAbortButton();
+        updateStatus('已中止');
+    }
+
+    // ==================== 展开全部（保留）====================
 
     async function expandAll() {
         if (isExpanding) { alert('正在展开中，请稍候...'); return; }
@@ -368,18 +583,16 @@
 
         isExpanding = false;
         updateStatus(`展开完成 ✓ 共 ${round} 轮`);
-
-        // 展开完后自动刷新追踪器的容器引用
         refreshTreeContainer();
     }
 
-    // ==================== 点击追踪模式 ====================
+    // ==================== 点击追踪模式（保留）====================
 
     function startClickTracker() {
         if (clickTrackerActive) return;
         clickTrackerActive = true;
-        document.addEventListener('mousedown', onTreeClick, true); // capture phase
-        log('点击追踪已启用 — 在类目树里点击即可记录');
+        document.addEventListener('mousedown', onTreeClick, true);
+        log('点击追踪已启用');
     }
 
     function stopClickTracker() {
@@ -389,68 +602,61 @@
     }
 
     function onTreeClick(e) {
-        // 忽略对 FAB / 面板的点击
         if (e.target.closest('#ozon-fab-root')) return;
-        // 如果面板开着，忽略面板上的点击
         if (e.target.closest('#ozon-panel')) return;
 
-        // 确认点击发生在树容器内
         const container = treeContainerRef || findTreeContainer();
-        if (!container) return;
-        if (!container.contains(e.target)) return;
+        if (!container || !container.contains(e.target)) return;
 
-        // 等待 DOM 更新后读取状态
-        setTimeout(() => {
-            handleTreeItemClick(e.target, container);
-        }, CONFIG.clickReadDelay);
+        const row = findClickedRow(e.target, container);
+        if (!row) return;
+
+        if (currentMode === 'smart') {
+            // 智能展开模式
+            const expander = findRowExpander(row);
+            const isExpanderClick = expander && (expander === e.target || expander.contains(e.target));
+            const expanded = isRowExpanded(row, container);
+
+            if (isExpanderClick || !expanded) {
+                // 点击展开按钮 或 节点未展开 → 智能展开采集
+                e.preventDefault();
+                e.stopPropagation();
+                runSmartExpandFromClick(row, container);
+            } else {
+                // 节点已展开，点击文本区 → 当作普通追踪
+                setTimeout(() => handleTreeItemClick(e.target, container), CONFIG.clickReadDelay);
+            }
+        } else {
+            // 普通点击追踪
+            setTimeout(() => handleTreeItemClick(e.target, container), CONFIG.clickReadDelay);
+        }
     }
 
     function handleTreeItemClick(target, container) {
         const row = findClickedRow(target, container);
-        if (!row) {
-            debug('点击追踪：未找到行容器', target);
-            return;
-        }
+        if (!row) { debug('点击追踪：未找到行', target); return; }
 
         const name = extractRowName(row);
-        if (!name) {
-            debug('点击追踪：未提取到类目名', row);
-            return;
-        }
+        if (!name) { debug('点击追踪：未提取到名称', row); return; }
 
-        // 构建路径
         const allRows = getAllVisibleRows(container);
         const { path, depth } = buildRowPath(row, allRows);
 
-        // 切换追踪状态
         if (trackedElements.has(row)) {
-            // 已追踪 → 取消
             trackedElements.delete(row);
             collectedData = collectedData.filter(d => d.path !== path);
             debug('取消追踪:', name);
         } else {
-            // 未追踪 → 添加
             trackedElements.set(row, { path, name, depth });
-            collectedData.push({ path, depth, name });
+            addCollectedData({ path, depth, name });
             debug('追踪:', name, '→', path);
         }
-
-        // 去重
-        const seen = new Set();
-        collectedData = collectedData.filter(d => {
-            if (seen.has(d.path)) return false;
-            seen.add(d.path);
-            return true;
-        });
 
         updateStatus(`已追踪 ${collectedData.length} 条类目`);
         renderResults();
         flashRow(row);
     }
 
-    /**
-     * 给被追踪的行一个视觉闪烁反馈
-     */
     function flashRow(rowEl) {
         if (!rowEl) return;
         const orig = rowEl.style.outline;
@@ -466,7 +672,7 @@
         }, 200);
     }
 
-    // ==================== 全量扫描模式 ====================
+    // ==================== 全量扫描（保留）====================
 
     async function scanAll() {
         const container = findTreeContainer();
@@ -477,7 +683,6 @@
 
         updateStatus('扫描中...');
 
-        // 先滚动一遍确保加载完
         const totalHeight = container.scrollHeight;
         let scrolled = 0;
         const step = CONFIG.scrollStep;
@@ -491,6 +696,7 @@
 
         const allRows = getAllVisibleRows(container);
         collectedData = [];
+        trackedElements.clear();
         const seen = new Set();
 
         for (const row of allRows) {
@@ -498,6 +704,7 @@
             if (name && name !== '未知' && !seen.has(path)) {
                 seen.add(path);
                 collectedData.push({ path, depth, name });
+                trackedElements.set(row, { path, name, depth });
             }
         }
 
@@ -530,12 +737,10 @@
             </tr>
         `).join('');
 
-        // 绑定删除按钮
         tbody.querySelectorAll('.ozon-remove-btn').forEach(btn => {
             btn.onclick = () => {
                 const idx = parseInt(btn.dataset.idx);
                 const removed = collectedData.splice(idx, 1)[0];
-                // 同步 trackedElements
                 for (const [el, info] of trackedElements) {
                     if (info.path === removed.path) trackedElements.delete(el);
                 }
@@ -554,7 +759,7 @@
 
     function downloadCSV() {
         if (collectedData.length === 0) {
-            alert('没有数据！请先点击类目进行追踪，或使用全量扫描。');
+            alert('没有数据！请先采集类目。');
             return;
         }
 
@@ -597,7 +802,7 @@
         }
     }
 
-    // ==================== UI 面板 ====================
+    // ==================== UI ====================
 
     function updateStatus(text) {
         const el = document.getElementById('ozon-collector-status');
@@ -613,10 +818,19 @@
         }
     }
 
+    function showAbortButton() {
+        const btn = document.getElementById('ozon-btn-abort');
+        if (btn) btn.style.display = 'flex';
+    }
+
+    function hideAbortButton() {
+        const btn = document.getElementById('ozon-btn-abort');
+        if (btn) btn.style.display = 'none';
+    }
+
     function initUI() {
         if (document.getElementById('ozon-fab-root')) return;
 
-        // ── 注入样式 ──
         const style = document.createElement('style');
         style.textContent = `
             /* ===== FAB ===== */
@@ -665,7 +879,7 @@
 
             /* ===== 面板 ===== */
             #ozon-panel {
-                position: fixed; bottom: 100px; right: 32px; width: 500px; max-height: 580px;
+                position: fixed; bottom: 100px; right: 32px; width: 520px; max-height: 620px;
                 background: #fff; border-radius: 16px;
                 box-shadow: 0 12px 48px rgba(0,0,0,0.2), 0 4px 12px rgba(0,0,0,0.08);
                 font-size: 13px; color: #333; z-index: 2147483646;
@@ -696,32 +910,35 @@
                 background: #f1f3f4; border-radius: 10px;
             }
             .ozon-mode-btn {
-                flex: 1; padding: 8px; border: none; border-radius: 8px; font-size: 13px;
+                flex: 1; padding: 8px 4px; border: none; border-radius: 8px; font-size: 12px;
                 font-weight: 500; cursor: pointer; transition: all 0.2s; background: transparent; color: #5f6368;
-                display: flex; align-items: center; justify-content: center; gap: 6px;
+                display: flex; align-items: center; justify-content: center; gap: 4px;
+                white-space: nowrap;
             }
             .ozon-mode-btn.active {
                 background: #fff; color: #1967d2; box-shadow: 0 1px 4px rgba(0,0,0,0.12); font-weight: 600;
             }
             .ozon-mode-btn:hover:not(.active) { background: #e8eaed; }
-            .ozon-mode-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+            .ozon-mode-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
 
-            /* 点击追踪提示 */
-            #ozon-track-hint {
+            /* 模式提示 */
+            #ozon-mode-hint {
                 margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; font-size: 12px;
                 background: linear-gradient(135deg, #e6f4ea 0%, #ceead6 100%);
                 border: 1px solid #a8dab5; color: #1e8e3e;
                 display: flex; align-items: center; gap: 8px;
             }
-            #ozon-track-hint svg { width: 18px; height: 18px; flex-shrink: 0; }
-            #ozon-track-hint.paused { display: none; }
+            #ozon-mode-hint svg { width: 18px; height: 18px; flex-shrink: 0; }
+            #ozon-mode-hint.paused { display: none; }
+            #ozon-mode-hint.smart-hint { background: linear-gradient(135deg, #e8f0fe 0%, #d2e3fc 100%); border-color: #a8c7fa; color: #1967d2; }
+            #ozon-mode-hint.scan-hint { background: linear-gradient(135deg, #fef3e8 0%, #fce8cc 100%); border-color: #f5c88a; color: #e37400; }
 
             /* 操作按钮 */
             #ozon-panel-buttons { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
             #ozon-panel-buttons button {
-                flex: 1; min-width: 100px; padding: 9px 8px; border: none; border-radius: 10px;
-                font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s;
-                display: flex; align-items: center; justify-content: center; gap: 6px;
+                flex: 1; min-width: 90px; padding: 9px 6px; border: none; border-radius: 10px;
+                font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s;
+                display: flex; align-items: center; justify-content: center; gap: 5px;
             }
             #ozon-panel-buttons button:active { transform: scale(0.97); }
             #ozon-panel-buttons button svg { width: 14px; height: 14px; }
@@ -735,6 +952,14 @@
             .ozon-btn-red:hover { background: linear-gradient(135deg, #f7d7d5, #f0b8b5); }
             .ozon-btn-gray { background: #f1f3f4; color: #5f6368; border: 1px solid #dadce0 !important; }
             .ozon-btn-gray:hover { background: #e8eaed; }
+
+            /* 中止按钮 */
+            #ozon-btn-abort {
+                display: none; background: linear-gradient(135deg, #fce8e6, #f7d7d5) !important;
+                color: #d93025 !important; border: 1px solid #f0b8b5 !important;
+                animation: ozon-abort-pulse 1.5s ease-in-out infinite;
+            }
+            @keyframes ozon-abort-pulse { 0%,100%{opacity:1;} 50%{opacity:0.6;} }
 
             /* 选项栏 */
             #ozon-panel-options {
@@ -770,7 +995,6 @@
 
         document.head.appendChild(style);
 
-        // ── 创建 DOM ──
         const root = document.createElement('div');
         root.id = 'ozon-fab-root';
         root.innerHTML = `
@@ -785,16 +1009,20 @@
                 <div id="ozon-panel-header">
                     <div class="ozon-header-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>Ozon 类目采集器 v2.0</span>
+                        <span>Ozon 类目采集器 v3.0</span>
                     </div>
                     <button id="ozon-btn-collapse" title="收起">▾</button>
                 </div>
                 <div id="ozon-panel-body">
                     <!-- 模式切换 -->
                     <div id="ozon-mode-bar">
-                        <button class="ozon-mode-btn active" data-mode="click">
+                        <button class="ozon-mode-btn active" data-mode="smart">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M18 9l-5 5-4-4-3 3"/></svg>
+                            智能展开
+                        </button>
+                        <button class="ozon-mode-btn" data-mode="click">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5"/></svg>
-                            点击追踪
+                            手动追踪
                         </button>
                         <button class="ozon-mode-btn" data-mode="scan">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
@@ -802,15 +1030,15 @@
                         </button>
                     </div>
 
-                    <!-- 点击追踪提示 -->
-                    <div id="ozon-track-hint">
+                    <!-- 模式提示 -->
+                    <div id="ozon-mode-hint" class="smart-hint">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-                        <span>追踪模式已启用 — 在左侧类目树里点击即可记录/取消，再点一次同一个类目会取消追踪</span>
+                        <span>点击类目旁的「展开箭头」→ 自动递归展开并采集该节点下所有子类目</span>
                     </div>
 
                     <!-- 操作按钮 -->
                     <div id="ozon-panel-buttons">
-                        <button id="ozon-btn-expand" class="ozon-btn-blue" title="递归展开所有类目节点">
+                        <button id="ozon-btn-expand" class="ozon-btn-blue" title="递归展开所有类目节点（不采集）">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
                             展开全部
                         </button>
@@ -821,6 +1049,10 @@
                         <button id="ozon-btn-download" class="ozon-btn-orange" title="导出 CSV">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
                             下载 CSV
+                        </button>
+                        <button id="ozon-btn-abort" class="ozon-btn-red" title="中止智能展开">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                            中止
                         </button>
                         <button id="ozon-btn-clear" class="ozon-btn-red" title="清空所有采集数据">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
@@ -859,13 +1091,12 @@
 
         document.body.appendChild(root);
 
-        // ── 元素引用 ──
         const fab = document.getElementById('ozon-fab');
         const panel = document.getElementById('ozon-panel');
-        const trackHint = document.getElementById('ozon-track-hint');
+        const modeHint = document.getElementById('ozon-mode-hint');
         let panelOpen = false;
 
-        // ── FAB 点击 ──
+        // FAB 点击
         fab.addEventListener('click', () => {
             panelOpen = !panelOpen;
             panel.classList.toggle('visible', panelOpen);
@@ -876,27 +1107,36 @@
             updateStatus(document.getElementById('ozon-collector-status')?.textContent || '');
         });
 
-        // ── 模式切换 ──
+        // 模式切换
         document.querySelectorAll('.ozon-mode-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.querySelectorAll('.ozon-mode-btn').forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
                 currentMode = btn.dataset.mode;
 
-                if (currentMode === 'click') {
+                // 更新提示文本和样式
+                modeHint.className = '';
+                if (currentMode === 'smart') {
+                    modeHint.classList.add('smart-hint');
+                    modeHint.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg><span>点击类目旁的「展开箭头」→ 自动递归展开并采集该节点下所有子类目</span>`;
                     startClickTracker();
                     fab.classList.add('tracking');
-                    trackHint.classList.remove('paused');
+                } else if (currentMode === 'click') {
+                    modeHint.classList.add('paused');
+                    modeHint.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg><span>追踪模式已启用 — 在左侧类目树里点击即可记录/取消</span>`;
+                    startClickTracker();
+                    fab.classList.add('tracking');
                 } else {
+                    modeHint.classList.add('scan-hint');
+                    modeHint.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg><span>全量扫描模式 — 点击下方「扫描当前」按钮抓取所有可见类目</span>`;
                     stopClickTracker();
                     fab.classList.remove('tracking');
-                    trackHint.classList.add('paused');
                 }
-                log(`切换到${currentMode === 'click' ? '点击追踪' : '全量扫描'}模式`);
+                log(`切换到${currentMode === 'smart' ? '智能展开' : currentMode === 'click' ? '手动追踪' : '全量扫描'}模式`);
             });
         });
 
-        // ── 面板内收起 ──
+        // 面板内收起
         document.getElementById('ozon-btn-collapse').onclick = () => {
             panelOpen = false;
             panel.classList.remove('visible');
@@ -904,11 +1144,12 @@
             fab.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span id="ozon-fab-badge"></span><span id="ozon-fab-tip">类目采集器</span>`;
         };
 
-        // ── 操作按钮 ──
+        // 操作按钮
         document.getElementById('ozon-btn-expand').onclick = expandAll;
         document.getElementById('ozon-btn-scan').onclick = scanAll;
         document.getElementById('ozon-btn-download').onclick = downloadCSV;
         document.getElementById('ozon-btn-clear').onclick = clearAll;
+        document.getElementById('ozon-btn-abort').onclick = abortSmartExpand;
         document.getElementById('ozon-debug-toggle').onchange = (e) => {
             CONFIG.debug = e.target.checked;
             log('调试模式:', CONFIG.debug ? '已开启' : '已关闭');
@@ -927,7 +1168,7 @@
             }
         };
 
-        // ── 面板拖拽 ──
+        // 面板拖拽
         let dragging = false, offset = { x: 0, y: 0 };
         const header = document.getElementById('ozon-panel-header');
         header.addEventListener('mousedown', (e) => {
@@ -946,7 +1187,7 @@
         });
         document.addEventListener('mouseup', () => dragging = false);
 
-        // ── 自动检测类目树 ──
+        // 自动检测类目树
         autoDetectTimer = setInterval(() => {
             const c = findTreeContainer();
             const status = document.getElementById('ozon-collector-status');
@@ -954,19 +1195,18 @@
             if (c && status && status.textContent.includes('请先打开')) {
                 status.textContent = '就绪 — 已检测到类目树 ✓';
                 status.className = 'status-ok';
-                // 自动启动点击追踪
-                if (!clickTrackerActive && currentMode === 'click') {
+                if (!clickTrackerActive && (currentMode === 'click' || currentMode === 'smart')) {
                     startClickTracker();
                     fab.classList.add('tracking');
                 }
             }
         }, 1500);
 
-        // 默认启用点击追踪模式
+        // 默认启用智能展开模式（启用点击追踪）
         startClickTracker();
         fab.classList.add('tracking');
 
-        log('Ozon 类目采集器 v2.0 已加载（点击追踪 + 全量扫描）');
+        log('Ozon 类目采集器 v3.0 已加载（智能展开 + 手动追踪 + 全量扫描）');
     }
 
     // ==================== 启动 ====================
