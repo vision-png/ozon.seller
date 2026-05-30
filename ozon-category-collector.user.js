@@ -1,16 +1,11 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  批量采集 Ozon 卖家后台类目。三种模式：①智能展开（点击展开按钮自动递归展开并采集整棵树）②手动追踪（点哪记哪）③全量扫描（一键抓取当前可见类目）。FAB 悬浮按钮 + 展开式面板。
+// @version      3.1
+// @description  批量采集 Ozon 卖家后台类目。三种模式：①智能展开（点击展开按钮自动递归展开并采集整棵树）②手动追踪（点哪记哪）③全量扫描（一键抓取当前可见类目）。FAB 悬浮按钮 + 展开式面板。v3.1 修复缩进检测和子节点查找逻辑。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
-// @run-at       document-end
-// @updateURL    https://raw.githubusercontent.com/vision-png/ozon.seller/main/ozon-category-collector.user.js
-// @downloadURL  https://raw.githubusercontent.com/vision-png/ozon.seller/main/ozon-category-collector.user.js
-// @supportURL   https://github.com/vision-png/ozon.seller/issues
-// @license      MIT
 // ==/UserScript==
 
 (function() {
@@ -303,36 +298,98 @@
     function getIndent(el) {
         if (!el) return 0;
         const s = window.getComputedStyle(el);
-        return (parseFloat(s.paddingLeft) || 0) + (parseFloat(s.marginLeft) || 0);
+        let indent = (parseFloat(s.paddingLeft) || 0) + (parseFloat(s.marginLeft) || 0);
+
+        // 策略2：如果行本身没有缩进，检查内部第一个可见子元素的左偏移
+        // Ozon 可能通过内部元素（如展开按钮/复选框容器）的 margin/padding 实现缩进
+        if (indent === 0) {
+            const children = Array.from(el.children);
+            for (const child of children) {
+                const cRect = child.getBoundingClientRect();
+                if (cRect.width > 0 && cRect.height > 0) {
+                    const elRect = el.getBoundingClientRect();
+                    indent = cRect.left - elRect.left;
+                    break;
+                }
+            }
+        }
+
+        // 策略3：检查所有子元素的最小 left 偏移（处理 flex 布局）
+        if (indent === 0) {
+            let minOffset = Infinity;
+            const elRect = el.getBoundingClientRect();
+            el.querySelectorAll('*').forEach(child => {
+                const cRect = child.getBoundingClientRect();
+                if (cRect.width > 0 && cRect.height > 0) {
+                    const offset = cRect.left - elRect.left;
+                    if (offset < minOffset) minOffset = offset;
+                }
+            });
+            if (minOffset !== Infinity && minOffset > 0) indent = minOffset;
+        }
+
+        return indent;
     }
 
     function getAllVisibleRows(container) {
         const rows = [];
         const excluded = /Применить|Очистить|应用|清除|Apply|Clear|选择|Выбрать|Категории|搜索|Search|Найти/i;
 
-        for (const child of container.children) {
-            const rect = child.getBoundingClientRect();
-            const text = child.textContent.trim();
-            if (rect.height > 12 && rect.height < 120 && text.length > 1 && text.length < 500) {
-                if (excluded.test(text) && rect.height < 60) continue;
-                rows.push(child);
-            }
+        function isValidRow(el) {
+            const rect = el.getBoundingClientRect();
+            const text = el.textContent.trim();
+            if (rect.height <= 12 || rect.height >= 120) return false;
+            if (text.length <= 1 || text.length >= 500) return false;
+            if (excluded.test(text) && rect.height < 60) return false;
+            // 需要包含直接的文本节点或文本子元素（排除纯容器）
+            const hasText = Array.from(el.childNodes).some(n =>
+                n.nodeType === 3 && n.textContent.trim().length > 0
+            ) || el.querySelector('span, label, div');
+            return hasText;
         }
 
+        // 策略1：直接子元素
+        for (const child of container.children) {
+            if (isValidRow(child)) rows.push(child);
+        }
+
+        // 策略2：孙子元素（如果直接子元素不够）
         if (rows.length < 3) {
             for (const child of container.children) {
                 for (const gc of child.children) {
-                    const rect = gc.getBoundingClientRect();
-                    const text = gc.textContent.trim();
-                    if (rect.height > 12 && rect.height < 120 && text.length > 1 && text.length < 500) {
-                        if (excluded.test(text) && rect.height < 60) continue;
-                        if (!rows.includes(gc)) rows.push(gc);
-                    }
+                    if (isValidRow(gc) && !rows.includes(gc)) rows.push(gc);
                 }
             }
         }
 
-        return rows;
+        // 策略3：递归搜索所有 div/li（如果还不够）
+        if (rows.length < 3) {
+            const candidates = container.querySelectorAll('div, li');
+            for (const el of candidates) {
+                if (isValidRow(el) && !rows.includes(el)) {
+                    // 过滤掉已被其他行包含的子元素（避免嵌套重复）
+                    const isNested = rows.some(r => r !== el && r.contains(el));
+                    if (!isNested) rows.push(el);
+                }
+            }
+        }
+
+        // 过滤：如果某行包含另一行，只保留外层（避免嵌套重复）
+        const filtered = [];
+        for (const row of rows) {
+            const isContained = rows.some(r => r !== row && r.contains(row));
+            if (!isContained) filtered.push(row);
+        }
+
+        // 按垂直位置排序
+        filtered.sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return ra.top - rb.top;
+        });
+
+        debug('getAllVisibleRows:', filtered.length, '行');
+        return filtered;
     }
 
     /**
@@ -414,12 +471,16 @@
             if (parent && parent !== container && parent.children.length > 1) {
                 const pRect = parent.getBoundingClientRect();
                 if (pRect.width > 60 && pRect.height > 16 && pRect.height < 200) {
-                    return parent;
+                    // 额外校验：必须能提取出类目名称（过滤筛选标签等非树元素）
+                    const name = extractRowName(parent);
+                    if (name && name.length > 0 && name.length < 100) {
+                        return parent;
+                    }
                 }
             }
             current = parent || current.parentElement;
         }
-        return current;
+        return null;
     }
 
     // ==================== 数据采集 ====================
@@ -449,12 +510,17 @@
             trackedElements.set(startRow, { path, name, depth });
         }
 
+        debug('采集节点:', name, '| 当前总行数:', allRows.length);
+
         // 查找展开按钮
         const expander = findRowExpander(startRow);
         if (!expander) {
-            debug('叶子节点:', name);
+            debug('叶子节点（无展开按钮）:', name);
             return;
         }
+
+        // 记录展开前的行集合（用于差异分析）
+        let beforeRowsSet = null;
 
         // 检查是否已展开
         const alreadyExpanded = isRowExpanded(startRow, container);
@@ -462,6 +528,8 @@
         if (!alreadyExpanded) {
             // 需要展开
             debug('展开节点:', name);
+            beforeRowsSet = new Set(getAllVisibleRows(container));
+
             try {
                 expander.scrollIntoView({ block: 'center', behavior: 'instant' });
                 expander.click();
@@ -470,37 +538,88 @@
             }
 
             // 等待子节点加载（最多等待 3 秒）
-            let prevChildCount = 0;
+            let prevRowCount = beforeRowsSet.size;
             let stableRounds = 0;
             for (let i = 0; i < 15; i++) {
                 await sleep(200);
                 if (smartExpandAbort) return;
 
                 const currentRows = getAllVisibleRows(container);
-                const children = findChildRows(startRow, currentRows);
-
-                if (children.length === prevChildCount) {
+                if (currentRows.length === prevRowCount) {
                     stableRounds++;
                     if (stableRounds >= 2) break;
                 } else {
                     stableRounds = 0;
-                    prevChildCount = children.length;
+                    prevRowCount = currentRows.length;
                 }
             }
         } else {
             debug('节点已展开:', name);
         }
 
-        // 获取展开后的子节点
+        // 获取展开后的子节点（多种策略）
         if (smartExpandAbort) return;
         const currentRows = getAllVisibleRows(container);
-        const childRows = findChildRows(startRow, currentRows);
+        let childRows = findChildRows(startRow, currentRows);
 
-        debug('子节点:', childRows.length, '个 ←', name);
+        debug('策略1(缩进)子节点:', childRows.length, '个 ←', name);
+
+        // 策略2：通过展开前后的差异找新增行
+        if (childRows.length === 0 && beforeRowsSet) {
+            const newRows = currentRows.filter(r => !beforeRowsSet.has(r));
+            debug('策略2: 新增行', newRows.length, '个');
+            if (newRows.length > 0) {
+                const startIndent = getIndent(startRow);
+                let minChildIndent = Infinity;
+                for (const r of newRows) {
+                    const ind = getIndent(r);
+                    const rName = extractRowName(r);
+                    debug('  新增行:', rName, '缩进:', ind);
+                    if (ind > startIndent && ind < minChildIndent) {
+                        minChildIndent = ind;
+                    }
+                }
+                if (minChildIndent !== Infinity) {
+                    childRows = newRows.filter(r => {
+                        const ind = getIndent(r);
+                        // 允许一定误差（浮点数比较）
+                        return Math.abs(ind - minChildIndent) < 2;
+                    });
+                    debug('策略2子节点:', childRows.length, '个 (缩进~', minChildIndent, ')');
+                } else {
+                    // 如果缩进没区别，新增行全部视为子节点
+                    childRows = newRows;
+                    debug('策略2子节点(无缩进差):', childRows.length, '个');
+                }
+            }
+        }
+
+        // 策略3：如果前面都失败，直接用路径分析收集所有后代
+        if (childRows.length === 0 && currentRows.length > allRows.length) {
+            debug('策略3: 路径分析采集后代');
+            const startPath = buildRowPath(startRow, currentRows).path;
+            for (const row of currentRows) {
+                if (row === startRow) continue;
+                const rowInfo = buildRowPath(row, currentRows);
+                if (rowInfo.path.startsWith(startPath + ' >') || rowInfo.path.startsWith(startPath + '>')) {
+                    if (rowInfo.name && rowInfo.name !== '未知') {
+                        addCollectedData(rowInfo);
+                        trackedElements.set(row, rowInfo);
+                    }
+                }
+            }
+            // 策略3直接采集了所有后代，不需要递归
+            debug('策略3完成');
+            return;
+        }
+
+        debug('最终子节点:', childRows.length, '个 ←', name);
 
         // 递归展开每个子节点
         for (const child of childRows) {
             if (smartExpandAbort) return;
+            const childName = extractRowName(child);
+            debug('递归进入子节点:', childName);
             await smartExpandAndCollect(child, container, visited);
         }
     }
@@ -612,20 +731,17 @@
         if (!row) return;
 
         if (currentMode === 'smart') {
-            // 智能展开模式
+            // 智能展开模式：只在明确点击「展开/折叠按钮」时触发智能展开
             const expander = findRowExpander(row);
             const isExpanderClick = expander && (expander === e.target || expander.contains(e.target));
-            const expanded = isRowExpanded(row, container);
 
-            if (isExpanderClick || !expanded) {
-                // 点击展开按钮 或 节点未展开 → 智能展开采集
+            if (isExpanderClick) {
+                // 点击展开按钮 → 智能展开采集
                 e.preventDefault();
                 e.stopPropagation();
                 runSmartExpandFromClick(row, container);
-            } else {
-                // 节点已展开，点击文本区 → 当作普通追踪
-                setTimeout(() => handleTreeItemClick(e.target, container), CONFIG.clickReadDelay);
             }
+            // 点击其他区域（复选框、文本等）不拦截，让页面正常处理
         } else {
             // 普通点击追踪
             setTimeout(() => handleTreeItemClick(e.target, container), CONFIG.clickReadDelay);
@@ -1009,7 +1125,7 @@
                 <div id="ozon-panel-header">
                     <div class="ozon-header-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>Ozon 类目采集器 v3.0</span>
+                        <span>Ozon 类目采集器 v3.1</span>
                     </div>
                     <button id="ozon-btn-collapse" title="收起">▾</button>
                 </div>
@@ -1206,7 +1322,7 @@
         startClickTracker();
         fab.classList.add('tracking');
 
-        log('Ozon 类目采集器 v3.0 已加载（智能展开 + 手动追踪 + 全量扫描）');
+        log('Ozon 类目采集器 v3.1 已加载（智能展开 + 手动追踪 + 全量扫描）');
     }
 
     // ==================== 启动 ====================
