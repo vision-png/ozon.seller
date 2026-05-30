@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  手动点击采集 Ozon 卖家后台类目树。点击类目行即可记录/取消，表格按一级/二级/三级类目分列显示，支持导出 CSV 和 Markdown。v4.0 重写核心提取逻辑，更准确识别类目名称。
+// @version      5.0
+// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。精准识别 --level CSS 变量层级、li 行元素、button 内文本。支持点击采集 + 一键全量扫描。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
@@ -19,17 +19,18 @@
     // ==================== 配置 ====================
     const CONFIG = {
         debug: false,
-        clickReadDelay: 80,
+        // Ozon 特征类名前缀（动态生成的 hash 前缀）
+        rowPrefixes: ['c7131', 'cs0131', 'cs2131', 'd19-', 'c6131'],
     };
 
     // ==================== 状态 ====================
-    let collectedData = [];       // [{path, l1, l2, l3, name, depth}]
-    let trackedElements = new Map(); // element -> {path, l1, l2, l3, name, depth}
+    let collectedData = [];
+    let trackedElements = new Map();
     let clickTrackerActive = false;
     let treeContainerRef = null;
     let autoDetectTimer = null;
 
-    // ==================== 黑名单（过滤非类目文本）====================
+    // ==================== 黑名单 ====================
     const BLACKLIST = new Set([
         '添加商品', '应用', '清除', '按类目搜索',
         'Применить', 'Очистить', 'Найти', 'Категории',
@@ -44,19 +45,17 @@
         if (t.length < 2 || t.length > 80) return true;
         if (/^\d+$/.test(t)) return true;
         if (BLACKLIST.has(t)) return true;
-        // 匹配 "类目: 1" / "Category: 1" 等
         if (/^(类目|Category|Категория)\s*[:：]\s*\d+$/.test(t)) return true;
-        // 匹配纯符号
         if (!/[\u4e00-\u9fa5a-zA-Zа-яА-ЯЁё0-9]/.test(t)) return true;
         return false;
     }
 
     // ==================== 工具函数 ====================
     function log(...args) {
-        console.log('%c[Ozon类目采集]', 'color:#005bff;font-weight:bold;', ...args);
+        console.log('%c[Ozon类目]', 'color:#005bff;font-weight:bold;', ...args);
     }
     function debug(...args) {
-        if (CONFIG.debug) console.log('%c[OzonDebug]', 'color:#f57c00;', ...args);
+        if (CONFIG.debug) console.log('%c[Debug]', 'color:#e37400;', ...args);
     }
     function escapeHtml(text) {
         const d = document.createElement('div');
@@ -64,129 +63,103 @@
         return d.innerHTML;
     }
 
-    // ==================== DOM 诊断（调试模式）====================
-    function diagnoseElement(el) {
-        console.group('%c[DOM 诊断]', 'color:#e37400;font-weight:bold;');
-        console.log('tagName:', el.tagName);
-        console.log('className:', el.className);
-        console.log('id:', el.id);
-        console.log('data-testid:', el.getAttribute('data-testid'));
-        console.log('textContent:', el.textContent.trim().substring(0, 100));
-        console.log('children:', Array.from(el.children).map(c =>
-            `${c.tagName}${c.className ? '.' + c.className.split(' ').slice(0,2).join('.') : ''}`
-        ).join(', '));
-
-        // 输出所有直接子元素的文本
-        console.log('直接子元素文本:');
-        Array.from(el.children).forEach((child, i) => {
-            const text = child.textContent.trim();
-            const rect = child.getBoundingClientRect();
-            console.log(`  [${i}] ${child.tagName} | w:${Math.round(rect.width)} h:${Math.round(rect.height)} | "${text.substring(0, 60)}"`);
-        });
-
-        // 输出内部所有 span/label/div 的文本（叶子节点）
-        console.log('候选文本元素:');
-        const leaves = [];
-        el.querySelectorAll('span, label, div, p, a').forEach(sub => {
-            if (sub.querySelector('svg, button, input, [role="checkbox"], [aria-checked]')) return;
-            const text = sub.textContent.trim();
-            if (isBlacklisted(text)) return;
-            const rect = sub.getBoundingClientRect();
-            if (rect.width < 20 || rect.height < 8) return;
-            leaves.push({ text, width: rect.width, tag: sub.tagName });
-        });
-        leaves.sort((a, b) => b.width - a.width);
-        leaves.slice(0, 5).forEach((l, i) => {
-            console.log(`  [${i}] ${l.tag} w:${Math.round(l.width)} | "${l.text.substring(0, 60)}"`);
-        });
-
-        console.log('innerHTML (前500字符):', el.innerHTML.substring(0, 500));
-        console.groupEnd();
+    /**
+     * 从元素的 style 属性中提取 --level CSS 变量值
+     * Ozon 用 style="--level: N; ..." 来标记层级深度
+     */
+    function getLevelFromStyle(el) {
+        if (!el || !el.style) return -1;
+        const style = el.getAttribute('style') || '';
+        const match = style.match(/--level\s*:\s*(\d+)/i);
+        return match ? parseInt(match[1]) : -1;
     }
 
-    // ==================== DOM 查找 ====================
+    // ==================== DOM 查找（基于真实结构）====================
 
+    /**
+     * 找到类目树的滚动容器
+     * 真实结构：div.cs2131-a2 (overflow scroll)
+     * 它包含 ul > li.c7131-a3 (每行)
+     */
     function findTreeContainer() {
-        // 语义选择器
-        const semanticSelectors = [
-            '[data-testid*="category"][data-testid*="tree"]',
-            '[data-testid*="category-tree"]',
-            '[data-testid*="categoryTree"]',
-            '[class*="category-tree" i]',
-            '[class*="categoryTree" i]',
-            '[class*="CategoryTree" i]',
-            '[class*="tree-select" i]',
-            '[class*="tree_select" i]',
-        ];
-        for (const sel of semanticSelectors) {
-            const el = document.querySelector(sel);
-            if (el) { debug('✓ 树容器 (语义):', sel); return el; }
-        }
-
-        // 评分策略
-        const candidates = document.querySelectorAll('div, ul, ol');
-        let best = null, bestScore = 0;
-
-        candidates.forEach(el => {
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 100 || rect.height < 150) return;
-
-            let score = 0;
-            score += el.querySelectorAll('input[type="checkbox"], [role="checkbox"]').length * 5;
-            score += el.querySelectorAll('[aria-checked], [aria-expanded]').length * 4;
-            score += el.querySelectorAll('svg').length * 0.5;
-
-            const text = el.textContent || '';
-            if (/Применить|Очистить|应用|清除|Apply|Clear/i.test(text)) score += 10;
-            if (/Категории|Категория|类目|Category/i.test(text)) score += 8;
-
-            // 统计有文本的叶子节点
-            let textCount = 0;
-            el.querySelectorAll('span, div').forEach(n => {
-                const t = n.childNodes[0];
-                if (t && t.nodeType === 3 && t.textContent.trim().length > 1) textCount++;
-            });
-            score += textCount * 0.3;
-
-            let depth = 0, p = el;
-            while (p) { depth++; p = p.parentElement; }
-            score -= depth * 0.2;
-
-            if (score > bestScore && score > 10) {
-                bestScore = score;
-                best = el;
-            }
-        });
-
-        if (best) { debug('✓ 树容器 (评分):', bestScore.toFixed(1)); return best; }
-
-        // Ozon 面板特征
-        const allDivs = document.querySelectorAll('div');
-        for (const div of allDivs) {
-            const text = div.textContent.trim();
-            if (/Применить|Очистить|应用|清除|Apply|Clear/i.test(text)) {
-                const rect = div.getBoundingClientRect();
-                if (rect.width > 200 && rect.height > 150) {
-                    if (div.querySelectorAll('svg').length > 3) {
-                        debug('✓ 树容器 (Ozon 面板)');
-                        return div;
-                    }
+        // 策略1：直接找 Ozon 特征类名的滚动容器
+        for (const prefix of CONFIG.rowPrefixes) {
+            // 找带有 overflow scroll 且包含多个 li 行元素的容器
+            const els = document.querySelectorAll(`[class*="${prefix}-a2"]`);
+            for (const el of els) {
+                const style = window.getComputedStyle(el);
+                if ((style.overflowY === 'auto' || style.overflowY === 'scroll' ||
+                     el.scrollHeight > el.clientHeight) &&
+                    el.querySelectorAll('li').length >= 2) {
+                    debug('✓ 树容器 (特征类名+滚动):', el.className, `${el.querySelectorAll('li').length} 行`);
+                    return el;
                 }
             }
         }
 
-        // 弹窗/下拉
-        const overlays = document.querySelectorAll([
-            '[class*="modal" i] [class*="content" i]:not([class*="modal-overlay" i])',
-            '[class*="dropdown" i] [class*="menu" i]',
-            '[class*="popover" i] [class*="content" i]',
-            '[class*="popup" i]',
-        ].join(','));
-        for (const ov of overlays) {
-            const rect = ov.getBoundingClientRect();
-            if (rect.width > 150 && rect.height > 200 && ov.querySelectorAll('div').length > 10) {
-                debug('✓ 树容器 (弹窗)');
-                return ov;
+        // 策略2：找包含 --level style 的 button 的最近公共滚动祖先
+        const levelBtns = document.querySelectorAll('button[style*="--level"]');
+        if (levelBtns.length > 0) {
+            // 取第一个 button，往上找到滚动容器
+            let container = levelBtns[0].parentElement;
+            while (container && container !== document.body) {
+                const s = window.getComputedStyle(container);
+                if (s.overflowY === 'auto' || s.overflowY === 'scroll' ||
+                    container.scrollHeight > container.clientHeight) {
+                    const liCount = container.querySelectorAll('li').length;
+                    if (liCount >= 2) {
+                        debug('✓ 树容器 (--level按钮→滚动):', container.className?.substring(0, 40), `${liCount} 行`);
+                        return container;
+                    }
+                }
+                container = container.parentElement;
+            }
+            // 如果没找到独立滚动容器，就用包含所有 levelBtns 的最接近的共同祖先
+            let common = levelBtns[0].closest('[class*="a2"]') || levelBtns[0].parentElement?.parentElement?.parentElement;
+            if (common && common.querySelectorAll('button[style*="--level"]').length >= 2) {
+                debug('✓ 树容器 (--level按钮→共同祖先):', common.className?.substring(0, 40));
+                return common;
+            }
+        }
+
+        // 策略3：找弹窗/下拉面板内最大的列表区域
+        const popups = document.querySelectorAll(
+            '[class*="popover" i], [class*="popup" i], [class*="dropdown" i] [class*="menu" i], ' +
+            '[role="dialog"], [role="listbox"]'
+        );
+        for (const popup of popups) {
+            const btns = popup.querySelectorAll('button[style*="--level"]');
+            if (btns.length >= 2) {
+                // 找到包含这些按钮的列表容器
+                const listContainer = findListContainerForButtons(btns);
+                if (listContainer) {
+                    debug('✓ 树容器 (弹窗+--level):', listContainer.className?.substring(0, 40), `${btns.length} 行`);
+                    return listContainer;
+                }
+                debug('✓ 树容器 (弹窗本身):', popup.className?.substring(0, 40), `${btns.length} 行`);
+                return popup;
+            }
+        }
+
+        // 策略4：全局搜索带 checkbox 和层级的列表
+        const allLi = document.querySelectorAll('li');
+        for (const li of allLi.slice(0, 200)) {
+            const btn = li.querySelector('button[style*="--level"]');
+            if (btn) {
+                const parent = li.parentElement;
+                if (parent && parent.querySelectorAll('li').length >= 2) {
+                    let container = parent.parentElement;
+                    // 再往上找一层到滚动容器
+                    if (container) {
+                        const scroller = container.closest('[class*="-a2"]') || container.parentElement;
+                        if (scroller) {
+                            debug('✓ 树容器 (li→parent):', scroller.className?.substring(0, 40));
+                            return scroller;
+                        }
+                    }
+                    debug('✓ 树容器 (li parent):', parent.className?.substring(0, 40), `${parent.querySelectorAll('li').length} 行`);
+                    return parent;
+                }
             }
         }
 
@@ -194,49 +167,114 @@
         return null;
     }
 
-    // ==================== 类目名称提取（核心）====================
+    /** 给定一组 --level buttons，找到它们的列表容器 */
+    function findListContainerForButtons(btns) {
+        if (!btns || btns.length === 0) return null;
+        // 所有 button 共享的最接近的祖先
+        let container = btns[0].parentElement;
+        while (container) {
+            const childBtns = container.querySelectorAll('button[style*="--level"]');
+            if (childBtns.length >= btns.length * 0.8) return container;
+            container = container.parentElement;
+            if (container === document.body) break;
+        }
+        return btns[0].closest('ul, [role="list"], [class*="list" i]') || btns[0].parentElement;
+    }
 
-    function extractCategoryName(row) {
-        if (!row) return '';
+    // ==================== 行检测与名称提取 ====================
 
-        // 策略1：找行内不包含交互元素的叶子文本元素，选最宽的
-        const candidates = [];
-        const textEls = row.querySelectorAll('span, label, div, p, a');
+    /**
+     * 获取所有类目行
+     * 真实结构：li > button[style="--level: N"] > (::before箭头) + div.checkbox + div.content(含名称)
+     */
+    function getAllCategoryRows(container) {
+        const rows = [];
+        if (!container) return rows;
 
-        for (const el of textEls) {
-            // 排除包含 SVG / button / input / checkbox 的元素
-            if (el.querySelector('svg, button, input, [role="checkbox"], [aria-checked]')) continue;
+        // 方法1：直接找带 --level 的 button，取其最近的 li 祖先
+        const allBtns = container.querySelectorAll('button[style*="--level"]');
+        const seen = new Set();
 
-            const text = el.textContent.trim();
-            if (isBlacklisted(text)) continue;
+        for (const btn of allBtns) {
+            // 找到这个 button 所属的行容器（li 或其父级）
+            let rowEl = btn.closest('li') || btn.parentElement;
 
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 30 || rect.height < 8) continue;
+            if (seen.has(rowEl)) continue;
+            seen.add(rowEl);
 
-            // 必须是叶子节点或接近叶子（不包含 div/span 子元素，或子元素很少）
-            const meaningfulChildren = Array.from(el.children).filter(c => {
-                const tag = c.tagName.toLowerCase();
-                return !['br', 'b', 'i', 'strong', 'em', 'span', 'small'].includes(tag);
+            const level = getLevelFromStyle(btn);
+            const name = extractNameFromButton(btn);
+
+            rows.push({
+                element: rowEl,
+                button: btn,
+                level: level,
+                name: name,
             });
-            if (meaningfulChildren.length > 0) continue;
-
-            candidates.push({ text, width: rect.width, el });
         }
 
-        if (candidates.length > 0) {
-            candidates.sort((a, b) => b.width - a.width);
-            for (const c of candidates) {
-                if (!isBlacklisted(c.text)) {
-                    return c.text.split('\n')[0].trim();
+        // 按 DOM 顺序排序（使用 sourceIndex / compareDocumentPosition）
+        rows.sort((a, b) => {
+            const pos = a.element.compareDocumentPosition(b.element);
+            return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+        });
+
+        debug(`getAllCategoryRows: ${rows.length} 行`);
+        return rows;
+    }
+
+    /**
+     * 从 button 元素内部提取类目名称
+     * 真实结构：button > (::before) + div.cs0131-a_a0(checkbox) + div.cs0131-a_a0.cs0131-a2(内容区)
+     * 内容区内包含实际文本
+     */
+    function extractNameFromButton(btn) {
+        if (!btn) return '';
+
+        // 遍历 button 的所有子元素，找包含有效文本的叶子节点
+        const candidates = [];
+
+        function scanChildren(el, depth = 0) {
+            if (depth > 6) return; // 防止过深递归
+
+            for (const child of Array.from(el.children)) {
+                // 跳过 checkbox 区域（通常包含 svg 或 role=checkbox）
+                const tag = child.tagName.toLowerCase();
+                const cls = child.className || '';
+
+                // 跳过明显的非文本元素
+                if (tag === 'svg' || tag === 'button' || tag === 'input') continue;
+                if (cls.includes('checkbox') || cls.includes('check') || child.querySelector('svg')) continue;
+                if (child.getAttribute('role') === 'checkbox') continue;
+
+                // 直接检查文本
+                const text = getTextContentClean(child);
+
+                if (text && !isBlacklisted(text)) {
+                    const rect = child.getBoundingClientRect();
+                    if (rect.width > 15 && rect.height > 8) {
+                        candidates.push({ text, width: rect.width, el: child });
+                        continue; // 有文本就不再深入这个分支
+                    }
                 }
+
+                // 没有有效文本，继续往下找
+                scanChildren(child, depth + 1);
             }
         }
 
-        // 策略2：退回到整行 textContent 分析
-        const allText = row.textContent.trim();
-        const lines = allText.split('\n')
-            .map(l => l.trim())
-            .filter(l => l.length >= 2 && l.length <= 80 && !isBlacklisted(l));
+        scanChildren(btn);
+
+        // 选宽度最大（最可能是完整文本）的候选
+        if (candidates.length > 0) {
+            candidates.sort((a, b) => b.width - a.width);
+            debug('extractNameFromButton 候选:', candidates.slice(0, 3).map(c => `"${c.text}" w:${Math.round(c.width)}`));
+            return candidates[0].text.split('\n')[0].trim();
+        }
+
+        // 兜底：取 button 整体 textContent 过滤后最长的一段
+        const allText = (btn.textContent || '').trim();
+        const lines = allText.split(/\s+/).filter(t => t.length >= 2 && !isBlacklisted(t));
         if (lines.length > 0) {
             lines.sort((a, b) => b.length - a.length);
             return lines[0];
@@ -245,141 +283,78 @@
         return '';
     }
 
-    // ==================== 行检测（核心改进）====================
+    /** 获取干净的文本内容（只取直接文本节点） */
+    function getTextContentClean(el) {
+        let text = '';
+        for (const node of Array.from(el.childNodes)) {
+            if (node.nodeType === 3) { // 文本节点
+                text += node.textContent.trim() + ' ';
+            } else if (node.nodeType === 1) { // 元素节点
+                // 只对简单的 inline 元素递归
+                const tag = node.tagName.toLowerCase();
+                if (['span', 'b', 'i', 'strong', 'em', 'small'].includes(tag)) {
+                    const sub = getTextContentClean(node);
+                    if (sub) text += sub + ' ';
+                }
+            }
+        }
+        return text.trim();
+    }
 
-    function findCategoryRow(target, container) {
+    /**
+     * 从点击目标找到对应的类目行
+     */
+    function findRowFromTarget(target, container) {
         let el = target;
-        for (let i = 0; i < 12; i++) {
-            if (!el || el === container || el === document.body) return null;
+        for (let i = 0; i < 15; i++) {
+            if (!el || el === document.body || el === container) break;
 
-            const rect = el.getBoundingClientRect();
-            if (rect.height < 20 || rect.height > 80 || rect.width < 80) {
-                el = el.parentElement;
-                continue;
+            // 检查是否就是行本身或行的子元素
+            const btn = el.tagName === 'BUTTON' && el.getAttribute('style')?.includes('--level')
+                ? el : el.querySelector('button[style*="--level"]');
+            if (btn) {
+                const row = btn.closest('li') || el;
+                return { row, button: btn };
             }
 
-            // 检查是否是树行：包含展开指示器或复选框
-            const hasIndicator = el.querySelector('svg, [class*="arrow" i], [class*="chevron" i], [aria-expanded], [class*="expand" i], [class*="toggle" i]');
-            const hasCheckbox = el.querySelector('[role="checkbox"], input[type="checkbox"], [aria-checked]');
-            const isTreeRow = hasIndicator || hasCheckbox;
-
-            if (!isTreeRow) {
-                el = el.parentElement;
-                continue;
-            }
-
-            const name = extractCategoryName(el);
-            if (name) {
-                if (CONFIG.debug) diagnoseElement(el);
-                return el;
-            }
+            // 检查是否在已知行内
+            const inRow = getAllCategoryRows(container).find(r => r.element.contains(el));
+            if (inRow) return inRow;
 
             el = el.parentElement;
         }
         return null;
     }
 
-    // ==================== 缩进检测 ====================
+    // ==================== 路径构建（基于 --level）====================
 
-    function getIndent(el) {
-        if (!el) return 0;
-        const s = window.getComputedStyle(el);
-        let indent = (parseFloat(s.paddingLeft) || 0) + (parseFloat(s.marginLeft) || 0);
-
-        // 策略2：第一个可见子元素的左偏移
-        if (indent === 0) {
-            for (const child of el.children) {
-                const cRect = child.getBoundingClientRect();
-                if (cRect.width > 0 && cRect.height > 0) {
-                    const elRect = el.getBoundingClientRect();
-                    indent = cRect.left - elRect.left;
-                    break;
-                }
-            }
-        }
-
-        // 策略3：所有可见子元素的最小左偏移
-        if (indent === 0) {
-            let minOffset = Infinity;
-            const elRect = el.getBoundingClientRect();
-            el.querySelectorAll('*').forEach(child => {
-                const cRect = child.getBoundingClientRect();
-                if (cRect.width > 0 && cRect.height > 0) {
-                    const offset = cRect.left - elRect.left;
-                    if (offset < minOffset) minOffset = offset;
-                }
-            });
-            if (minOffset !== Infinity && minOffset > 0) indent = minOffset;
-        }
-
-        return indent;
-    }
-
-    // ==================== 获取所有可见行 ====================
-
-    function getAllVisibleRows(container) {
-        const rows = [];
-        const candidates = container.querySelectorAll('div, li');
-
-        for (const el of candidates) {
-            const rect = el.getBoundingClientRect();
-            const text = el.textContent.trim();
-
-            if (rect.height < 20 || rect.height > 80) continue;
-            if (text.length < 2 || text.length > 200) continue;
-
-            // 必须有展开指示器或复选框
-            const hasIndicator = el.querySelector('svg, [class*="arrow" i], [class*="chevron" i], [aria-expanded]');
-            const hasCheckbox = el.querySelector('[role="checkbox"], input[type="checkbox"], [aria-checked]');
-            if (!hasIndicator && !hasCheckbox) continue;
-
-            const name = extractCategoryName(el);
-            if (!name) continue;
-
-            // 过滤嵌套
-            const isContained = rows.some(r => r !== el && r.contains(el));
-            if (!isContained) rows.push(el);
-        }
-
-        // 按垂直位置排序
-        rows.sort((a, b) => {
-            const ra = a.getBoundingClientRect();
-            const rb = b.getBoundingClientRect();
-            return ra.top - rb.top;
-        });
-
-        debug('getAllVisibleRows:', rows.length, '行');
-        return rows;
-    }
-
-    // ==================== 路径构建 ====================
-
-    function buildRowPath(targetRow, allRows) {
-        const name = extractCategoryName(targetRow);
+    /**
+     * 使用 --level 层级栈构建路径
+     * Ozon 的 --level 是从 1 开始的整数，表示嵌套深度
+     */
+    function buildPathForRow(targetRowInfo, allRows) {
+        const { name, level } = targetRowInfo;
         if (!name) return null;
 
-        const targetIndent = getIndent(targetRow);
-        const stack = [];
+        // 用 level 构建栈
+        const stack = []; // [{level, name}]
 
-        for (const row of allRows) {
-            const indent = getIndent(row);
-            const rName = extractCategoryName(row);
-            if (!rName) continue;
-
-            while (stack.length > 0 && indent <= stack[stack.length - 1].indent) {
+        for (const rowInfo of allRows) {
+            // 弹出比当前 level 大或等于的（因为同级的下一个应该替换）
+            while (stack.length > 0 && stack[stack.length - 1].level >= rowInfo.level) {
                 stack.pop();
             }
-            stack.push({ indent, name: rName });
+            stack.push({ level: rowInfo.level, name: rowInfo.name });
 
-            if (row === targetRow) {
+            if (rowInfo === targetRowInfo) {
                 const pathParts = stack.map(s => s.name).filter(Boolean);
                 return {
                     path: pathParts.join(' > '),
                     l1: pathParts[0] || '',
                     l2: pathParts[1] || '',
                     l3: pathParts[2] || '',
-                    name: rName,
-                    depth: pathParts.length
+                    name: name,
+                    depth: pathParts.length,
                 };
             }
         }
@@ -387,40 +362,87 @@
         return { path: name, l1: name, l2: '', l3: '', name, depth: 1 };
     }
 
-    // ==================== 点击处理 ====================
+    // ==================== 全量扫描 ====================
+
+    function scanAllCategories() {
+        const container = treeContainerRef || findTreeContainer();
+        if (!container) {
+            alert('未找到类目树！请先打开「类目」筛选弹窗。');
+            return;
+        }
+
+        const rows = getAllCategoryRows(container);
+        if (rows.length === 0) {
+            alert('类目树为空或无法解析。请开启调试模式查看详情。');
+            return;
+        }
+
+        // 清空旧数据
+        clearAll();
+
+        // 收集所有行
+        for (const rowInfo of rows) {
+            if (!rowInfo.name) continue;
+            const info = buildPathForRow(rowInfo, rows);
+            if (info) {
+                trackedElements.set(rowInfo.element, info);
+                collectedData.push(info);
+            }
+        }
+
+        updateStatus(`已扫描 ${collectedData.length} 条类目 ✓`);
+        renderResults();
+        log(`全量扫描完成: ${collectedData.length} 条`);
+    }
+
+    // ==================== 点击追踪处理 ====================
 
     function onTreeClick(e) {
+        // 忽略自身面板内的点击
         if (e.target.closest('#ozon-fab-root')) return;
 
         const container = treeContainerRef || findTreeContainer();
-        if (!container || !container.contains(e.target)) return;
+        if (!container) return;
+        if (!container.contains(e.target)) return;
 
-        const row = findCategoryRow(e.target, container);
-        if (!row) {
-            debug('点击未识别为类目行:', e.target.tagName, e.target.className?.substring(0, 50));
+        const found = findRowFromTarget(e.target, container);
+        if (!found) {
+            debug('点击未匹配类目行:', e.target.tagName, e.target.className?.substring(0, 50));
             return;
         }
 
-        const allRows = getAllVisibleRows(container);
-        const info = buildRowPath(row, allRows);
-        if (!info) {
-            debug('无法构建路径');
+        const { row, button } = found;
+        const level = getLevelFromStyle(button);
+        const name = extractNameFromButton(button);
+
+        if (!name) {
+            debug('无法提取类目名称:', button.outerHTML.substring(0, 200));
             return;
         }
+
+        // 获取所有可见行来构建路径
+        const allRows = getAllCategoryRows(container);
+
+        // 在现有 allRows 中找当前这一条
+        const currentRowInfo = allRows.find(r => r.element === row) ||
+                               { element: row, button, level, name };
+
+        const info = buildPathForRow(currentRowInfo, allRows);
+        if (!info) return;
 
         // 切换追踪状态
         if (trackedElements.has(row)) {
             trackedElements.delete(row);
             collectedData = collectedData.filter(d => d.path !== info.path);
+            flashRow(row, '#d93025');
             debug('取消追踪:', info.name);
-            flashRow(row, 'remove');
         } else {
             const exists = collectedData.some(d => d.path === info.path);
             if (!exists) {
                 trackedElements.set(row, info);
                 collectedData.push(info);
-                debug('追踪:', info.name, '→', info.path);
-                flashRow(row, 'add');
+                flashRow(row, '#34a853');
+                debug('追踪:', info.name, '(L' + info.depth + ')', info.path);
             }
         }
 
@@ -428,17 +450,14 @@
         renderResults();
     }
 
-    function flashRow(rowEl, action) {
+    function flashRow(rowEl, color) {
         if (!rowEl) return;
-        const color = action === 'add' ? '#34a853' : '#d93025';
         rowEl.style.transition = 'box-shadow 0.3s';
-        rowEl.style.boxShadow = `inset 0 0 0 2px ${color}`;
-        setTimeout(() => {
-            rowEl.style.boxShadow = '';
-        }, 600);
+        rowEl.style.boxShadow = `inset 3px 0 0 ${color}`;
+        setTimeout(() => { rowEl.style.boxShadow = ''; }, 500);
     }
 
-    // ==================== 数据采集 ====================
+    // ==================== 数据操作 ====================
 
     function clearAll() {
         collectedData = [];
@@ -456,19 +475,19 @@
         document.getElementById('ozon-result-count').textContent = collectedData.length;
 
         if (collectedData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">暂无数据 — 在左侧类目树中点击即可采集</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">暂无数据 — 在类目弹窗中点击采集，或使用「全量扫描」</td></tr>';
             return;
         }
 
         tbody.innerHTML = collectedData.map((item, i) => `
             <tr>
-                <td style="text-align:center;color:#999;">${i + 1}</td>
+                <td style="text-align:center;color:#999;width:28px;">${i + 1}</td>
                 <td>${escapeHtml(item.l1)}</td>
                 <td>${escapeHtml(item.l2)}</td>
                 <td>${escapeHtml(item.l3)}</td>
-                <td>${escapeHtml(item.name)}</td>
-                <td style="text-align:center;">
-                    <button class="ozon-remove-btn" data-idx="${i}" title="移除此条" style="background:none;border:1px solid #dadce0;border-radius:4px;padding:2px 8px;cursor:pointer;color:#5f6368;font-size:11px;">✕</button>
+                <td><strong>${escapeHtml(item.name)}</strong></td>
+                <td style="text-align:center;width:36px;">
+                    <button class="ozon-remove-btn" data-idx="${i}" title="移除" style="background:none;border:1px solid #dadce0;border-radius:4px;padding:2px 8px;cursor:pointer;color:#5f6368;font-size:11px;">✕</button>
                 </td>
             </tr>
         `).join('');
@@ -489,46 +508,26 @@
     // ==================== 导出 ====================
 
     function downloadCSV() {
-        if (collectedData.length === 0) {
-            alert('没有数据！请先点击类目树采集。');
-            return;
-        }
-
+        if (collectedData.length === 0) { alert('没有数据！'); return; }
         const headers = ['一级类目', '二级类目', '三级类目', '类目名称'];
         const rows = collectedData.map(d => [d.l1, d.l2, d.l3, d.name]);
-
         const csv = [
             headers.join(','),
             ...rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(','))
         ].join('\r\n');
 
-        const BOM = '\uFEFF';
-        const blob = new Blob([BOM + csv], { type: 'text/csv;charset=utf-8;' });
+        const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
-
-        const ts = new Date().toLocaleString('zh-CN', {
-            year: 'numeric', month: '2-digit', day: '2-digit',
-            hour: '2-digit', minute: '2-digit', second: '2-digit',
-            hour12: false
-        }).replace(/[/:]/g, '-').replace(/\s/g, '_');
-
         const a = document.createElement('a');
         a.href = url;
-        a.download = `ozon-categories-${ts}.csv`;
-        document.body.appendChild(a);
+        a.download = `ozon-categories-${formatTime()}.csv`;
         a.click();
-        document.body.removeChild(a);
         URL.revokeObjectURL(url);
-
         updateStatus(`CSV 已下载 ✓ ${collectedData.length} 条`);
     }
 
     function downloadMD() {
-        if (collectedData.length === 0) {
-            alert('没有数据！请先点击类目树采集。');
-            return;
-        }
-
+        if (collectedData.length === 0) { alert('没有数据！'); return; }
         const lines = [
             '# Ozon 类目采集结果',
             '',
@@ -536,47 +535,35 @@
             `> 共 ${collectedData.length} 条`,
             '',
             '| 序号 | 一级类目 | 二级类目 | 三级类目 | 类目名称 |',
-            '|------|----------|----------|----------|----------|'
+            '|------|----------|----------|----------|----------|',
+            ...collectedData.map((d, i) =>
+                `| ${i + 1} | ${d.l1 || '-'} | ${d.l2 || '-'} | ${d.l3 || '-'} | ${d.name || '-'} |`
+            ),
+            '',
+            '*Generated by Ozon Category Collector v5.0*',
         ];
-
-        collectedData.forEach((d, i) => {
-            const l1 = d.l1 || '-';
-            const l2 = d.l2 || '-';
-            const l3 = d.l3 || '-';
-            const name = d.name || '-';
-            lines.push(`| ${i + 1} | ${l1} | ${l2} | ${l3} | ${name} |`);
-        });
-
-        lines.push('', '---', '*Generated by Ozon Category Collector*');
-
         const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
-
-        const ts = new Date().toLocaleString('zh-CN', {
-            year: 'numeric', month: '2-digit', day: '2-digit',
-            hour: '2-digit', minute: '2-digit', second: '2-digit',
-            hour12: false
-        }).replace(/[/:]/g, '-').replace(/\s/g, '_');
-
         const a = document.createElement('a');
         a.href = url;
-        a.download = `ozon-categories-${ts}.md`;
-        document.body.appendChild(a);
+        a.download = `ozon-categories-${formatTime()}.md`;
         a.click();
-        document.body.removeChild(a);
         URL.revokeObjectURL(url);
-
         updateStatus(`Markdown 已下载 ✓ ${collectedData.length} 条`);
+    }
+
+    function formatTime() {
+        return new Date().toLocaleString('zh-CN', {
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+        }).replace(/[/:]/g, '-').replace(/\s/g, '_');
     }
 
     // ==================== 自动检测 ====================
 
     function refreshTreeContainer() {
         const c = findTreeContainer();
-        if (c) {
-            treeContainerRef = c;
-            debug('容器已刷新');
-        }
+        if (c) treeContainerRef = c;
     }
 
     // ==================== UI ====================
@@ -598,209 +585,184 @@
     function initUI() {
         if (document.getElementById('ozon-fab-root')) return;
 
+        // ===== 样式 =====
         const style = document.createElement('style');
         style.textContent = `
-            /* ===== FAB ===== */
-            #ozon-fab-root {
-                position: fixed;
-                bottom: 32px;
-                right: 32px;
-                z-index: 2147483647;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
-            }
-            #ozon-fab {
-                width: 56px; height: 56px; border-radius: 50%;
+            /* FAB */
+            #ozon-fab-root { position: fixed; bottom: 32px; right: 32px; z-index: 2147483647;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif; }
+            #ozon-fab { width: 56px; height: 56px; border-radius: 50%;
                 background: linear-gradient(135deg, #005bff 0%, #003d99 100%);
-                border: none; cursor: pointer;
-                display: flex; align-items: center; justify-content: center;
+                border: none; cursor: pointer; display: flex; align-items: center; justify-content: center;
                 box-shadow: 0 4px 16px rgba(0,91,255,0.4), 0 2px 4px rgba(0,0,0,0.12);
-                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-                position: relative; outline: none; color: #fff;
-            }
+                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); position: relative; outline: none; color: #fff; }
             #ozon-fab:hover { transform: scale(1.08); box-shadow: 0 6px 24px rgba(0,91,255,0.5); }
             #ozon-fab:active { transform: scale(0.95); }
-            #ozon-fab.open { border-radius: 16px; width: 44px; height: 44px; background: linear-gradient(135deg, #e8eaed 0%, #dadce0 100%); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-            #ozon-fab svg { width: 26px; height: 26px; transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+            #ozon-fab.open { border-radius: 16px; width: 44px; height: 44px;
+                background: linear-gradient(135deg, #e8eaed 0%, #dadce0 100%);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+            #ozon-fab svg { width: 26px; height: 26px; transition: transform 0.3s; }
             #ozon-fab.open svg { transform: rotate(90deg); width: 20px; height: 20px; color: #5f6368; }
-            #ozon-fab.tracking { background: linear-gradient(135deg, #34a853 0%, #1e8e3e 100%); box-shadow: 0 4px 16px rgba(52,168,83,0.4); }
+            #ozon-fab.tracking { background: linear-gradient(135deg, #34a853 0%, #1e8e3e 100%);
+                box-shadow: 0 4px 16px rgba(52,168,83,0.4); }
             #ozon-fab.tracking.open { background: linear-gradient(135deg, #e8eaed 0%, #dadce0 100%); }
-            #ozon-fab::before {
-                content: ''; position: absolute; width: 100%; height: 100%; border-radius: 50%;
-                background: rgba(0,91,255,0.3); animation: ozon-fab-pulse 2.5s ease-in-out infinite; z-index: -1;
-            }
+            #ozon-fab::before { content:''; position:absolute; width:100%; height:100%; border-radius:50%;
+                background: rgba(0,91,255,0.3); animation: ozon-pulse 2.5s ease-in-out infinite; z-index:-1; }
             #ozon-fab.tracking::before { background: rgba(52,168,83,0.3); }
-            #ozon-fab.open::before { animation: none; opacity: 0; }
-            @keyframes ozon-fab-pulse { 0%,100%{transform:scale(1);opacity:0.4;} 50%{transform:scale(1.6);opacity:0;} }
-            #ozon-fab-badge {
-                position: absolute; top: -4px; right: -4px; min-width: 20px; height: 20px; padding: 0 6px;
-                border-radius: 10px; background: #e37400; color: #fff; font-size: 11px; font-weight: 600;
-                display: none; align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(227,116,0,0.3); line-height: 1;
-            }
-            #ozon-fab-tip {
-                position: absolute; right: 68px; top: 50%; transform: translateY(-50%);
-                background: #323232; color: #fff; font-size: 13px; padding: 6px 12px; border-radius: 6px;
-                white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-            }
-            #ozon-fab-tip::after { content:''; position: absolute; right: -6px; top: 50%; transform: translateY(-50%) rotate(45deg); width: 10px; height: 10px; background: #323232; }
-            #ozon-fab:hover #ozon-fab-tip { opacity: 1; }
+            #ozon-fab.open::before { animation:none; opacity:0; }
+            @keyframes ozon-pulse { 0%,100%{transform:scale(1);opacity:0.4;} 50%{transform:scale(1.6);opacity:0;} }
+            #ozon-fab-badge { position:absolute; top:-4px; right:-4px; min-width:20px; height:20px; padding:0 6px;
+                border-radius:10px; background:#e37400; color:#fff; font-size:11px; font-weight:600;
+                display:none; align-items:center; justify-content:center; line-height:1; }
+            #ozon-fab-tip { position:absolute; right:68px; top:50%; transform:translateY(-50%);
+                background:#323232; color:#fff; font-size:13px; padding:6px 12px; border-radius:6px;
+                white-space:nowrap; opacity:0; pointer-events:none; transition:opacity 0.2s; }
+            #ozon-fab-tip::after { content:''; position:absolute; right:-6px; top:50%; transform:translateY(-50%) rotate(45deg);
+                width:10px; height:10px; background:#323232; }
+            #ozon-fab:hover #ozon-fab-tip { opacity:1; }
 
-            /* ===== 面板 ===== */
-            #ozon-panel {
-                position: fixed; bottom: 100px; right: 32px; width: 560px; max-height: 640px;
+            /* 面板 */
+            #ozon-panel { position: fixed; bottom: 100px; right: 32px; width: 600px; max-height: 660px;
                 background: #fff; border-radius: 16px;
                 box-shadow: 0 12px 48px rgba(0,0,0,0.2), 0 4px 12px rgba(0,0,0,0.08);
                 font-size: 13px; color: #333; z-index: 2147483646;
                 overflow: hidden; display: flex; flex-direction: column; line-height: 1.5;
                 transform-origin: bottom right;
                 transform: scale(0.4) translateY(20px); opacity: 0; pointer-events: none;
-                transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.25s ease;
-            }
+                transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.25s ease; }
             #ozon-panel.visible { transform: scale(1) translateY(0); opacity: 1; pointer-events: auto; }
-            #ozon-panel-header {
-                background: linear-gradient(135deg, #005bff 0%, #003d99 100%); color: #fff;
+            #ozon-panel-header { background: linear-gradient(135deg, #005bff 0%, #003d99 100%); color: #fff;
                 padding: 14px 18px; font-weight: 600; font-size: 15px;
                 display: flex; justify-content: space-between; align-items: center;
-                cursor: move; user-select: none; flex-shrink: 0; letter-spacing: 0.3px;
-            }
+                cursor: move; user-select: none; flex-shrink: 0; letter-spacing: 0.3px; }
             #ozon-panel-header .ozon-header-title { display: flex; align-items: center; gap: 8px; }
-            #ozon-panel-header button {
-                background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 15px;
-                cursor: pointer; width: 28px; height: 28px; line-height: 28px; text-align: center;
-                border-radius: 8px; padding: 0; transition: background 0.15s;
-            }
+            #ozon-panel-header button { background: rgba(255,255,255,0.15); border: none; color: #fff;
+                font-size: 15px; cursor: pointer; width: 28px; height: 28px; line-height: 28px;
+                text-align: center; border-radius: 8px; padding: 0; transition: background 0.15s; }
             #ozon-panel-header button:hover { background: rgba(255,255,255,0.3); }
             #ozon-panel-body { padding: 16px 18px 18px; overflow-y: auto; flex: 1; min-height: 0; }
 
-            /* 模式提示 */
-            #ozon-mode-hint {
-                margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; font-size: 12px;
+            /* 提示 */
+            #ozon-mode-hint { margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; font-size: 12px;
                 background: linear-gradient(135deg, #e6f4ea 0%, #ceead6 100%);
-                border: 1px solid #a8dab5; color: #1e8e3e;
-                display: flex; align-items: center; gap: 8px;
-            }
+                border: 1px solid #a8dab5; color: #1e8e3e; display: flex; align-items: center; gap: 8px; }
             #ozon-mode-hint svg { width: 18px; height: 18px; flex-shrink: 0; }
 
-            /* 操作按钮 */
+            /* 按钮 */
             #ozon-panel-buttons { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
-            #ozon-panel-buttons button {
-                flex: 1; min-width: 80px; padding: 9px 6px; border: none; border-radius: 10px;
+            #ozon-panel-buttons button { flex: 1; min-width: 90px; padding: 10px 8px; border: none; border-radius: 10px;
                 font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s;
-                display: flex; align-items: center; justify-content: center; gap: 5px;
-            }
+                display: flex; align-items: center; justify-content: center; gap: 5px; }
             #ozon-panel-buttons button:active { transform: scale(0.97); }
             #ozon-panel-buttons button svg { width: 14px; height: 14px; }
-            .ozon-btn-blue { background: linear-gradient(135deg, #e8f0fe, #d2e3fc); color: #1967d2; border: 1px solid #a8c7fa !important; }
-            .ozon-btn-blue:hover { background: linear-gradient(135deg, #d2e3fc, #aecbfa); }
-            .ozon-btn-green { background: linear-gradient(135deg, #e6f4ea, #ceead6); color: #1e8e3e; border: 1px solid #a8dab5 !important; }
-            .ozon-btn-green:hover { background: linear-gradient(135deg, #ceead6, #b7e1c7); }
-            .ozon-btn-orange { background: linear-gradient(135deg, #fef3e8, #fce8cc); color: #e37400; border: 1px solid #f5c88a !important; }
-            .ozon-btn-orange:hover { background: linear-gradient(135deg, #fce8cc, #fad9a8); }
-            .ozon-btn-red { background: linear-gradient(135deg, #fce8e6, #f7d7d5); color: #d93025; border: 1px solid #f0b8b5 !important; }
-            .ozon-btn-red:hover { background: linear-gradient(135deg, #f7d7d5, #f0b8b5); }
-            .ozon-btn-gray { background: #f1f3f4; color: #5f6368; border: 1px solid #dadce0 !important; }
-            .ozon-btn-gray:hover { background: #e8eaed; }
+            .ob-blue { background: linear-gradient(135deg, #e8f0fe, #d2e3fc); color: #1967d2; border: 1px solid #a8c7fa !important; }
+            .ob-blue:hover { background: linear-gradient(135deg, #d2e3fc, #aecbfa); }
+            .ob-green { background: linear-gradient(135deg, #e6f4ea, #ceead6); color: #1e8e3e; border: 1px solid #a8dab5 !important; }
+            .ob-green:hover { background: linear-gradient(135deg, #ceead6, #b7e1c7); }
+            .ob-orange { background: linear-gradient(135deg, #fef3e8, #fce8cc); color: #e37400; border: 1px solid #f5c88a !important; }
+            .ob-orange:hover { background: linear-gradient(135deg, #fce8cc, #fad9a8); }
+            .ob-red { background: linear-gradient(135deg, #fce8e6, #f7d7d5); color: #d93025; border: 1px solid #f0b8b5 !important; }
+            .ob-red:hover { background: linear-gradient(135deg, #f7d7d5, #f0b8b5); }
+            .ob-gray { background: #f1f3f4; color: #5f6368; border: 1px solid #dadce0 !important; }
+            .ob-gray:hover { background: #e8eaed; }
+            .ob-purple { background: linear-gradient(135deg, #f3e8fd, #e8d4f5); color: #7b1fa2; border: 1px solid #ce93d8 !important; }
+            .ob-purple:hover { background: linear-gradient(135deg, #e8d4f5, #dcb8e9); }
 
             /* 选项栏 */
-            #ozon-panel-options {
-                display: flex; align-items: center; justify-content: space-between;
-                margin-bottom: 10px; padding: 6px 0;
-                border-top: 1px solid #f1f3f4; border-bottom: 1px solid #f1f3f4;
-            }
+            #ozon-panel-options { display: flex; align-items: center; justify-content: space-between;
+                margin-bottom: 10px; padding: 6px 0; border-top: 1px solid #f1f3f4; border-bottom: 1px solid #f1f3f4; }
             #ozon-panel-options label { cursor: pointer; display: flex; align-items: center; gap: 5px; font-size: 12px; color: #666; }
             #ozon-panel-options input[type="checkbox"] { cursor: pointer; accent-color: #005bff; }
 
             /* 状态栏 */
-            #ozon-collector-status {
-                font-size: 12px; color: #5f6368; margin-bottom: 12px; padding: 8px 12px;
-                background: #f8f9fa; border-radius: 8px; border-left: 3px solid #005bff; transition: all 0.3s;
-            }
+            #ozon-collector-status { font-size: 12px; color: #5f6368; margin-bottom: 12px; padding: 8px 12px;
+                background: #f8f9fa; border-radius: 8px; border-left: 3px solid #005bff; transition: all 0.3s; }
             #ozon-collector-status.status-ok { border-left-color: #34a853; background: #f0faf0; color: #1e8e3e; }
             #ozon-collector-status.status-warn { border-left-color: #e37400; background: #fef8f0; color: #e37400; }
 
-            /* 结果表格 */
-            #ozon-collector-results { max-height: 280px; overflow-y: auto; border: 1px solid #e8eaed; border-radius: 10px; background: #fafbfc; }
+            /* 表格 */
+            #ozon-collector-results { max-height: 300px; overflow-y: auto; border: 1px solid #e8eaed;
+                border-radius: 10px; background: #fafbfc; }
             #ozon-collector-results table { width: 100%; border-collapse: collapse; font-size: 12px; }
-            #ozon-collector-results th, #ozon-collector-results td { padding: 7px 8px; text-align: left; border-bottom: 1px solid #e8eaed; white-space: nowrap; }
-            #ozon-collector-results th { background: #f1f3f4; font-weight: 600; position: sticky; top: 0; color: #5f6368; font-size: 11px; text-transform: uppercase; letter-spacing: 0.3px; z-index: 1; }
+            #ozon-collector-results th, #ozon-collector-results td { padding: 8px 10px; text-align: left;
+                border-bottom: 1px solid #e8eaed; white-space: nowrap; }
+            #ozon-collector-results th { background: #f1f3f4; font-weight: 600; position: sticky; top: 0;
+                color: #5f6368; font-size: 11px; text-transform: uppercase; letter-spacing: 0.3px; z-index: 1; }
             #ozon-collector-results tr:last-child td { border-bottom: none; }
             #ozon-collector-results tr:hover td { background: #e8f0fe; }
-            #ozon-collector-results td:nth-child(2),
-            #ozon-collector-results td:nth-child(3),
-            #ozon-collector-results td:nth-child(4),
-            #ozon-collector-results td:nth-child(5) { white-space: normal; word-break: break-all; max-width: 140px; }
+            #ozon-collector-results td:nth-child(n+2):nth-last-child(n+2) { white-space: normal; word-break: break-all; max-width: 130px; }
             .ozon-remove-btn { transition: all 0.15s; }
             .ozon-remove-btn:hover { background: #d93025 !important; color: #fff !important; border-color: #d93025 !important; }
 
-            /* 结果计数 */
             #ozon-result-bar { margin-top: 10px; font-size: 11px; color: #999; text-align: center; }
         `;
-
         document.head.appendChild(style);
 
+        // ===== HTML 结构 =====
         const root = document.createElement('div');
         root.id = 'ozon-fab-root';
         root.innerHTML = `
-            <button id="ozon-fab" title="Ozon 类目采集器">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M4 7h16M4 12h16M4 17h10"/>
-                </svg>
+            <button id="ozon-fab" title="Ozon 类目采集器 v5.0">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
                 <span id="ozon-fab-badge"></span>
                 <span id="ozon-fab-tip">类目采集器</span>
             </button>
             <div id="ozon-panel">
                 <div id="ozon-panel-header">
                     <div class="ozon-header-title">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>Ozon 类目采集器 v4.0</span>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                        <span>Ozon 类目采集器 v5.0</span>
                     </div>
                     <button id="ozon-btn-collapse" title="收起">▾</button>
                 </div>
                 <div id="ozon-panel-body">
-                    <!-- 模式提示 -->
                     <div id="ozon-mode-hint">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-                        <span>手动追踪模式 — 在左侧类目树中点击任意类目行即可记录/取消</span>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+                        <span>支持点击逐个采集 + 一键全量扫描（基于 Ozon DOM --level 层级）</span>
                     </div>
 
-                    <!-- 操作按钮 -->
                     <div id="ozon-panel-buttons">
-                        <button id="ozon-btn-download-csv" class="ozon-btn-orange" title="导出 CSV">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-                            下载 CSV
+                        <button id="ozon-btn-scan-all" class="ob-purple" title="自动扫描弹窗内所有已加载的类目">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <path d="M21 21l-6-6m2-5a7 7 0 1 1-14 0 7 7 0 0 1 14 0z"/></svg>
+                            全量扫描
                         </button>
-                        <button id="ozon-btn-download-md" class="ozon-btn-blue" title="导出 Markdown">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                            下载 MD
+                        <button id="ozon-btn-download-csv" class="ob-orange" title="导出 CSV">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                            CSV
                         </button>
-                        <button id="ozon-btn-clear" class="ozon-btn-red" title="清空所有采集数据">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                        <button id="ozon-btn-download-md" class="ob-blue" title="导出 Markdown">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                            MD
+                        </button>
+                        <button id="ozon-btn-clear" class="ob-red" title="清空">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                             清空
                         </button>
                     </div>
 
-                    <!-- 选项 -->
                     <div id="ozon-panel-options">
-                        <label title="控制台输出详细日志 + DOM 诊断">
+                        <label title="控制台输出详细日志">
                             <input type="checkbox" id="ozon-debug-toggle"> 调试模式
                         </label>
-                        <button id="ozon-btn-detect" class="ozon-btn-gray" style="padding:4px 12px;font-size:11px;border-radius:6px;border:1px solid #dadce0;background:#f8f9fa;cursor:pointer;color:#5f6368;">检测树</button>
+                        <button id="ozon-btn-detect" class="ob-gray" style="padding:4px 12px;font-size:11px;border-radius:6px;cursor:pointer;">检测树</button>
                     </div>
 
-                    <div id="ozon-collector-status">就绪 — 请先打开「类目」筛选弹窗</div>
+                    <div id="ozon-collector-status">就绪 — 请打开「类目」筛选弹窗</div>
                     <div id="ozon-collector-results">
                         <table>
-                            <thead>
-                                <tr>
-                                    <th style="width:28px;text-align:center;">#</th>
-                                    <th style="width:110px;">一级类目</th>
-                                    <th style="width:110px;">二级类目</th>
-                                    <th style="width:110px;">三级类目</th>
-                                    <th style="width:110px;">类目名称</th>
-                                    <th style="width:36px;text-align:center;"></th>
-                                </tr>
-                            </thead>
+                            <thead><tr>
+                                <th style="width:28px;text-align:center;">#</th>
+                                <th>一级类目</th><th>二级类目</th><th>三级类目</th><th>类目名称</th><th style="width:36px;"></th>
+                            </tr></thead>
                             <tbody id="ozon-collector-tbody">
-                                <tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">暂无数据 — 在左侧类目树中点击即可采集</td></tr>
+                                <tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">暂无数据</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -808,66 +770,58 @@
                 </div>
             </div>
         `;
-
         document.body.appendChild(root);
 
+        // ===== 事件绑定 =====
         const fab = document.getElementById('ozon-fab');
         const panel = document.getElementById('ozon-panel');
         let panelOpen = false;
 
-        // FAB 点击
         fab.addEventListener('click', () => {
             panelOpen = !panelOpen;
             panel.classList.toggle('visible', panelOpen);
             fab.classList.toggle('open', panelOpen);
             fab.innerHTML = panelOpen
-                ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg><span id="ozon-fab-badge"></span>`
+                ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg><span id="ozon-fab-badge"></span>`
                 : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span id="ozon-fab-badge"></span><span id="ozon-fab-tip">类目采集器</span>`;
             updateStatus(document.getElementById('ozon-collector-status')?.textContent || '');
         });
 
-        // 面板内收起
         document.getElementById('ozon-btn-collapse').onclick = () => {
-            panelOpen = false;
-            panel.classList.remove('visible');
-            fab.classList.remove('open');
+            panelOpen = false; panel.classList.remove('visible'); fab.classList.remove('open');
             fab.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span id="ozon-fab-badge"></span><span id="ozon-fab-tip">类目采集器</span>`;
         };
 
-        // 操作按钮
+        document.getElementById('ozon-btn-scan-all').onclick = scanAllCategories;
         document.getElementById('ozon-btn-download-csv').onclick = downloadCSV;
         document.getElementById('ozon-btn-download-md').onclick = downloadMD;
         document.getElementById('ozon-btn-clear').onclick = clearAll;
+
         document.getElementById('ozon-debug-toggle').onchange = (e) => {
             CONFIG.debug = e.target.checked;
-            log('调试模式:', CONFIG.debug ? '已开启' : '已关闭');
-            if (CONFIG.debug) {
-                console.log('%c[提示]', 'color:#005bff;font-weight:bold;', '调试模式已开启。点击类目树中的元素时，控制台会输出该元素的 DOM 诊断信息。');
-            }
+            log('调试模式:', CONFIG.debug ? '开' : '关');
         };
+
         document.getElementById('ozon-btn-detect').onclick = () => {
             const c = findTreeContainer();
             const status = document.getElementById('ozon-collector-status');
             if (c) {
-                status.textContent = '已检测到类目树 ✓';
-                status.className = 'status-ok';
-                treeContainerRef = c;
-                log('手动检测成功');
+                status.textContent = `已检测到 ✓ (${c.querySelectorAll('button[style*="--level"]').length} 个行)`;
+                status.className = 'status-ok'; treeContainerRef = c;
+                log('手动检测成功:', c.className?.substring(0, 40));
             } else {
-                status.textContent = '未检测到类目树 ✗';
-                status.className = 'status-warn';
+                status.textContent = '未检测到 ✗'; status.className = 'status-warn';
             }
         };
 
-        // 面板拖拽
+        // 拖拽
         let dragging = false, offset = { x: 0, y: 0 };
         const header = document.getElementById('ozon-panel-header');
         header.addEventListener('mousedown', (e) => {
             if (e.target.tagName === 'BUTTON') return;
             dragging = true;
             const rect = panel.getBoundingClientRect();
-            offset.x = e.clientX - rect.left;
-            offset.y = e.clientY - rect.top;
+            offset.x = e.clientX - rect.left; offset.y = e.clientY - rect.top;
             panel.style.bottom = 'auto'; panel.style.right = 'auto';
             panel.style.left = rect.left + 'px'; panel.style.top = rect.top + 'px';
         });
@@ -878,26 +832,22 @@
         });
         document.addEventListener('mouseup', () => dragging = false);
 
-        // 自动检测类目树
+        // 自动检测
         autoDetectTimer = setInterval(() => {
             const c = findTreeContainer();
             const status = document.getElementById('ozon-collector-status');
             if (c) treeContainerRef = c;
-            if (c && status && status.textContent.includes('请先打开')) {
-                status.textContent = '就绪 — 已检测到类目树 ✓';
+            if (c && status?.textContent.includes('请先打开')) {
+                status.textContent = `就绪 ✓ (${c.querySelectorAll('button[style*="--level"]').length} 个行)`;
                 status.className = 'status-ok';
-                if (!clickTrackerActive) {
-                    startClickTracker();
-                    fab.classList.add('tracking');
-                }
+                if (!clickTrackerActive) { startClickTracker(); fab.classList.add('tracking'); }
             }
         }, 1500);
 
-        // 默认启用点击追踪
+        // 启动
         startClickTracker();
         fab.classList.add('tracking');
-
-        log('Ozon 类目采集器 v4.0 已加载（手动追踪 + 分级显示 + MD导出）');
+        log('Ozon 类目采集器 v5.0 加载完成（基于 --level DOM 结构）');
     }
 
     function startClickTracker() {
@@ -910,7 +860,6 @@
     function stopClickTracker() {
         clickTrackerActive = false;
         document.removeEventListener('click', onTreeClick, true);
-        log('点击追踪已关闭');
     }
 
     // ==================== 启动 ====================
