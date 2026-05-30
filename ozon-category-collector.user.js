@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  批量展开、采集 Ozon 卖家后台类目树，导出 CSV。FAB 悬浮按钮 + 展开式操作面板。
+// @version      1.2
+// @description  批量展开、采集 Ozon 卖家后台类目树，导出 CSV。FAB 悬浮按钮 + 展开式操作面板。支持 Ozon 自定义 checkbox。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
@@ -110,8 +110,25 @@
             return best;
         }
 
-        // ── 策略3：弹窗/下拉内容区兜底 ──
-        // 如果当前有打开的弹窗或下拉，找其中内容最多的区域
+        // ── 策略3：基于 Ozon 特有元素检测 ──
+        // Ozon 的下拉面板通常包含「应用」按钮、自定义蓝色 checkbox 等
+        const allDivs = document.querySelectorAll('div');
+        for (const div of allDivs) {
+            const text = div.textContent.trim();
+            // 包含「应用」按钮 + 搜索框 + checkbox 行，且可见
+            if (text.includes('应用') || text.includes('Применить') || text.includes('Apply')) {
+                const rect = div.getBoundingClientRect();
+                if (rect.width > 200 && rect.height > 150) {
+                    // 检查里面是否有 checkbox（原生或自定义）
+                    if (div.querySelector('input[type="checkbox"], [class*="checked" i], [class*="checkbox" i], svg')) {
+                        debug('✓ 树容器 (Ozon 面板特征):', div);
+                        return div;
+                    }
+                }
+            }
+        }
+
+        // ── 策略4：弹窗/下拉内容区兜底 ──
         const overlays = document.querySelectorAll([
             '[class*="modal" i] [class*="content" i]:not([class*="modal-overlay" i])',
             '[class*="dropdown" i] [class*="menu" i]',
@@ -124,8 +141,7 @@
         for (const ov of overlays) {
             const rect = ov.getBoundingClientRect();
             if (rect.width > 150 && rect.height > 200 && ov.querySelectorAll('div').length > 10) {
-                // 进一步确认里面确实有 checkbox 或 treeitem
-                if (ov.querySelector('input[type="checkbox"], [role="treeitem"], [aria-expanded]')) {
+                if (ov.querySelector('input[type="checkbox"], [role="treeitem"], [aria-expanded], [class*="checked" i], [class*="checkbox" i]')) {
                     debug('✓ 树容器 (弹窗内容区):', ov);
                     return ov;
                 }
@@ -215,26 +231,66 @@
 
     /**
      * 查找所有已选中的类目项
+     * 支持：原生 checkbox、aria-checked、class 含 checked/selected、
+     * 以及 Ozon 风格的自定义 checkbox（选中状态的 SVG 或特定 class 组合）
      */
     function findCheckedItems(container) {
         if (!container) return [];
         const checked = new Set();
 
-        // 原生 checkbox
+        // ── 方式1：原生 checkbox ──
         container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
             if (cb.checked) checked.add(cb);
         });
 
-        // aria-checked="true"
+        // ── 方式2：aria-checked="true" ──
         container.querySelectorAll('[aria-checked="true"]').forEach(el => {
             checked.add(el);
         });
 
-        // checked/selected class（需要排除祖先未选中的情况，通过找最小单元）
+        // ── 方式3：class 含 checked/selected（取叶子级，避免祖先膨胀） ──
         container.querySelectorAll('[class*="checked" i], [class*="selected" i]').forEach(el => {
-            // 只保留叶子级别的选中元素（最小匹配）
             const childChecked = el.querySelector('[class*="checked" i], [class*="selected" i]');
             if (!childChecked) checked.add(el);
+        });
+
+        // ── 方式4：Ozon 自定义 checkbox — 通过 SVG 内容识别选中状态 ──
+        // Ozon 的 checkbox 是一个 <svg> 元素，选中时内部包含对勾路径
+        // 策略：找包含对勾 SVG 的行级元素
+        const allSvgs = container.querySelectorAll('svg');
+        allSvgs.forEach(svg => {
+            const inner = svg.innerHTML || svg.outerHTML;
+            // 检测对勾/勾选路径（polyline checkmark、path checkmark 等）
+            const isCheckmark = inner.includes('polyline') ||
+                                 inner.includes('M5 13l4 4L19 7') ||
+                                 inner.includes('M4.5 12.5l3') ||
+                                 inner.includes('check') ||
+                                 // 圆角矩形 + 对勾的组合（Ozon 常见）
+                                 (svg.querySelector('rect, circle') && svg.querySelector('polyline, path'));
+            if (isCheckmark) {
+                // 向上找到最近的「行」容器
+                const row = findClosestRow(svg, container);
+                if (row) checked.add(row);
+            }
+        });
+
+        // ── 方式5：通过 computed style 检测自定义勾选框 ──
+        // Ozon checkbox 选中时背景为蓝色(#005bff)，未选中时为灰色/透明
+        container.querySelectorAll('svg').forEach(svg => {
+            const rect = svg.getBoundingClientRect();
+            if (rect.width < 5 || rect.height < 5) return;
+            // 14~20px 的方形 SVG 通常是 checkbox
+            if (rect.width > 20 || rect.height > 20) return;
+            // 检查自身或父元素的背景色是否为蓝色（选中状态）
+            let checkTarget = svg.closest('div') || svg;
+            const style = window.getComputedStyle(checkTarget);
+            const bgColor = style.backgroundColor;
+            // #005bff 或 rgb(0, 91, 255) 表示选中
+            if (bgColor === 'rgb(0, 91, 255)' || bgColor === 'rgb(0, 91, 255)' ||
+                bgColor.includes('0, 91, 255') || bgColor.includes('0,91,255')) {
+                const row = findClosestRow(svg, container);
+                if (row) checked.add(row);
+            }
         });
 
         debug(`找到 ${checked.size} 个选中项`);
@@ -242,14 +298,39 @@
     }
 
     /**
+     * 向上查找最近的「行」级容器
+     * 适配 Ozon 平铺式列表（每行是一个 div 容器）
+     */
+    function findClosestRow(el, container) {
+        let current = el;
+        for (let i = 0; i < 10; i++) {
+            if (!current || current === container || current === document.body) return null;
+            // 如果当前元素有 sibling（兄弟元素），说明它是一个行的子元素
+            const parent = current.parentElement;
+            if (parent && parent.children.length > 1) {
+                // 检查这个父级是否像一个行容器
+                const pRect = parent.getBoundingClientRect();
+                // 行通常有合理的宽度但不至于太宽
+                if (pRect.width > 80 && pRect.height > 20 && pRect.height < 200) {
+                    return parent;
+                }
+            }
+            current = parent || current.parentElement;
+        }
+        return current || el;
+    }
+
+    /**
      * 从节点向上回溯，构建完整路径
+     * 适配两种结构：
+     *   A) 标准 tree 结构（role="treeitem" + 嵌套）
+     *   B) Ozon 平铺列表（通过 padding-left / margin-left 缩进表示层级）
      */
     function buildFullPath(node, container) {
         const pathNames = [];
         let current = node;
 
         // 先找到当前节点对应的「行/节点」元素
-        // 策略：向上查找直到遇到 treeitem 或一个包含 checkbox 的层级块
         let row = current;
         for (let i = 0; i < 6; i++) {
             if (!row || row === container) break;
@@ -261,7 +342,7 @@
             row = row.parentElement;
         }
 
-        // 从 row 向上回溯收集各级名称
+        // ── 方式A：标准树结构回溯 ──
         current = row;
         while (current && current !== container) {
             const name = extractNodeName(current);
@@ -269,7 +350,6 @@
                 pathNames.unshift(name);
             }
 
-            // 向上找到父级 treeitem / 节点
             let parent = current.parentElement;
             for (let i = 0; i < 4; i++) {
                 if (!parent || parent === container) break;
@@ -282,45 +362,163 @@
             current = parent;
         }
 
-        const leafName = pathNames[pathNames.length - 1] || extractNodeName(row) || '未知类目';
-        return {
-            fullPath: pathNames.join(' > '),
-            depth: pathNames.length,
-            name: leafName
-        };
+        // 如果方式A成功获取到路径，直接返回
+        if (pathNames.length > 0) {
+            return {
+                fullPath: pathNames.join(' > '),
+                depth: pathNames.length,
+                name: pathNames[pathNames.length - 1]
+            };
+        }
+
+        // ── 方式B：平铺列表结构 — 通过缩进级别推断层级 ──
+        // 找到当前行以及所有同级的行，根据缩进构建树
+        return buildPathFromFlatList(row, container);
+    }
+
+    /**
+     * 从平铺列表构建路径（Ozon 常见模式）
+     * 通过比较行的 padding-left / margin-left 来推断父子关系
+     */
+    function buildPathFromFlatList(row, container) {
+        if (!row || !container) return { fullPath: '未知类目', depth: 1, name: '未知类目' };
+
+        const rowIndent = getElementIndent(row);
+        const name = extractNodeName(row) || '未知类目';
+
+        // 收集所有行的缩进信息
+        const allRows = getAllRows(container);
+        const rowStack = []; // 缩进栈
+
+        for (const r of allRows) {
+            const indent = getElementIndent(r);
+            const rName = extractNodeName(r) || '';
+
+            // 维护栈：缩进大于栈顶则入栈，否则弹出直到找到父级
+            while (rowStack.length > 0 && indent <= rowStack[rowStack.length - 1].indent) {
+                rowStack.pop();
+            }
+            rowStack.push({ indent, name: rName, el: r });
+
+            // 如果是目标行，构建路径
+            if (r === row || r.contains(row) || row.contains(r)) {
+                const path = rowStack.map(s => s.name).filter(Boolean);
+                return {
+                    fullPath: path.join(' > '),
+                    depth: path.length,
+                    name: name
+                };
+            }
+        }
+
+        return { fullPath: name, depth: 1, name };
+    }
+
+    /**
+     * 获取元素的缩进值（padding-left + margin-left）
+     */
+    function getElementIndent(el) {
+        if (!el) return 0;
+        const style = window.getComputedStyle(el);
+        const pl = parseFloat(style.paddingLeft) || 0;
+        const ml = parseFloat(style.marginLeft) || 0;
+        return pl + ml;
+    }
+
+    /**
+     * 获取容器内所有「行」级元素
+     */
+    function getAllRows(container) {
+        const rows = [];
+        // 策略：找所有可能包含类目名和 checkbox 的行
+        const candidates = container.children;
+        for (const child of candidates) {
+            const rect = child.getBoundingClientRect();
+            const text = child.textContent.trim();
+            // 过滤：可见、有文本内容、不是纯按钮区域
+            if (rect.height > 15 && rect.height < 100 && text.length > 1 && text.length < 300) {
+                // 排除按钮栏（含「应用」「清除」等）
+                if (/(应用|清除|Применить|Очистить|Apply|Clear|选择|Выбрать)/i.test(text) && rect.height < 50) continue;
+                rows.push(child);
+            }
+        }
+        // 如果子元素不够，尝试孙元素（有时行嵌套一层）
+        if (rows.length < 3) {
+            for (const child of candidates) {
+                for (const grandchild of child.children) {
+                    const rect = grandchild.getBoundingClientRect();
+                    const text = grandchild.textContent.trim();
+                    if (rect.height > 15 && rect.height < 100 && text.length > 1 && text.length < 300) {
+                        if (/(应用|清除|Применить|Очистить|Apply|Clear)/i.test(text) && rect.height < 50) continue;
+                        rows.push(grandchild);
+                    }
+                }
+            }
+        }
+        return rows;
     }
 
     /**
      * 从单个节点提取类目名称文本
+     * 策略：优先找最短的有意义文本（类目名通常就是一行文本）
      */
     function extractNodeName(node) {
         if (!node) return '';
 
-        // 策略1：找直接子文本节点最长的 span/div
-        const textEls = node.querySelectorAll('span, div, label');
-        let bestText = '', bestLen = 0;
+        // 策略1：找直接包含文本的叶子 span（排除含子元素的）
+        const spans = node.querySelectorAll('span, div, p, label, a');
+        const leafTexts = [];
 
-        for (const el of textEls) {
-            // 只取直接文本（避免把子节点文本也带进来）
+        for (const el of spans) {
+            // 叶子条件：没有含文本的子元素
+            const hasTextChild = Array.from(el.children).some(c => {
+                const t = c.textContent.trim();
+                return t.length > 0 && c.getBoundingClientRect().height > 0;
+            });
+            if (hasTextChild) continue;
+
             const directText = Array.from(el.childNodes)
                 .filter(n => n.nodeType === 3)
                 .map(n => n.textContent.trim())
-                .join('');
+                .filter(t => t.length > 0)
+                .join(' ')
+                .trim();
 
-            if (directText.length > bestLen && directText.length < 200 && directText.length > 0) {
-                // 排除纯数字或特殊符号
-                if (/[\u4e00-\u9fa5a-zA-Zа-яА-Я]/.test(directText)) {
-                    bestLen = directText.length;
-                    bestText = directText;
-                }
+            // 也尝试 el.textContent（有些情况下文本在 innerHTML 赋值中）
+            const fullText = el.textContent.trim();
+
+            const text = directText || fullText;
+
+            if (text.length > 0 && text.length < 150 &&
+                /[\u4e00-\u9fa5a-zA-Zа-яА-ЯЁё]/.test(text) &&
+                !/^\d+$/.test(text)) {
+                const rect = el.getBoundingClientRect();
+                leafTexts.push({ text, width: rect.width, height: rect.height });
             }
         }
 
-        if (bestText) return bestText;
+        if (leafTexts.length > 0) {
+            // 优先取可见且宽度适中的（类目名通常是最主要的文本块）
+            const visible = leafTexts.filter(t => t.width > 20 && t.height > 0);
+            if (visible.length > 0) {
+                // 按宽度排序取最宽的（类目名通常占最多空间）
+                visible.sort((a, b) => b.width - a.width);
+                return visible[0].text.split('\n')[0].trim();
+            }
+            return leafTexts[0].text.split('\n')[0].trim();
+        }
 
-        // 策略2：直接取所有文本
-        const allText = node.textContent.trim().split('\n')[0].trim();
-        if (allText.length > 0 && allText.length < 200) return allText;
+        // 策略2：排除 checkbox SVG 和按钮文字后的纯文本
+        const allText = node.textContent.trim();
+        const lines = allText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        // 过滤掉太短的（可能是图标 aria-label）和太长的（包含子元素）
+        for (const line of lines) {
+            if (line.length > 1 && line.length < 100 &&
+                /[\u4e00-\u9fa5a-zA-Zа-яА-ЯЁё]/.test(line) &&
+                !/^\d+$/.test(line)) {
+                return line;
+            }
+        }
 
         return '';
     }
@@ -1119,7 +1317,7 @@
             }
         }, 1500);
 
-        log('Ozon 类目采集器已加载 v1.1 (FAB 悬浮窗模式)');
+        log('Ozon 类目采集器已加载 v1.2 (FAB 悬浮窗 + Ozon 自定义 checkbox 支持)');
     }
 
     // ==================== 启动 ====================
