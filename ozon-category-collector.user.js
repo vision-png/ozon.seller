@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      5.2
-// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。v5.2 基于 table-500 类名精准提取 L1/L2/L3 类目文本。支持点击采集 + 一键全量扫描。
+// @version      5.3
+// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。v5.3 支持虚拟滚动列表的滚动采集。基于 table-500 类名精准提取 L1/L2/L3 类目文本。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
@@ -363,38 +363,118 @@
         return { path: name, l1: name, l2: '', l3: '', name, depth: 1 };
     }
 
-    // ==================== 全量扫描 ====================
+    // ==================== 全量扫描（虚拟滚动兼容）====================
 
-    function scanAllCategories() {
+    let scanInProgress = false;
+
+    function sleep(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function scanAllCategories() {
         const container = treeContainerRef || findTreeContainer();
         if (!container) {
             alert('未找到类目树！请先打开「类目」筛选弹窗。');
             return;
         }
 
-        const rows = getAllCategoryRows(container);
-        if (rows.length === 0) {
-            alert('类目树为空或无法解析。请开启调试模式查看详情。');
+        if (scanInProgress) {
+            alert('正在扫描中，请稍候...');
             return;
         }
 
-        // 清空旧数据
-        clearAll();
+        // 检测是否是虚拟滚动（当前DOM行数远小于容器可显示的行数）
+        const visibleRows = container.querySelectorAll('li').length;
+        const isVirtual = visibleRows > 0 && visibleRows <= 35 && container.scrollHeight > container.clientHeight * 2;
+        debug('扫描模式:', isVirtual ? '虚拟滚动采集' : '一次性采集', `当前DOM行:${visibleRows}`);
 
-        // 收集所有行（按 path 去重）
+        scanInProgress = true;
+        clearAll();
+        updateStatus('正在扫描...');
+
+        // 用 path 去重
         const seenPaths = new Set();
-        for (const rowInfo of rows) {
-            if (!rowInfo.name) continue;
-            const info = buildPathForRow(rowInfo, rows);
-            if (info && !seenPaths.has(info.path)) {
-                seenPaths.add(info.path);
-                collectedData.push(info);
+        let totalCollected = 0;
+        let rounds = 0;
+
+        if (isVirtual) {
+            // ===== 虚拟滚动：逐步滚动采集 =====
+            const scroller = container.scrollTop !== undefined ? container : container.querySelector('[class*="-a2"]') || container;
+            const scrollStep = Math.max(200, Math.floor(scroller.clientHeight * 0.6)); // 每次滚 60% 容器高度
+            const maxRounds = 200; // 安全上限
+
+            // 先滚到顶部
+            scroller.scrollTop = 0;
+            await sleep(400);
+
+            let lastScrollTop = -1;
+            let stagnantCount = 0;
+
+            while (rounds < maxRounds) {
+                rounds++;
+                const currentRows = getAllCategoryRows(container);
+                let newInRound = 0;
+
+                for (const rowInfo of currentRows) {
+                    if (!rowInfo.name) continue;
+                    const info = buildPathForRow(rowInfo, currentRows);
+                    if (info && !seenPaths.has(info.path)) {
+                        seenPaths.add(info.path);
+                        collectedData.push(info);
+                        newInRound++;
+                    }
+                }
+                totalCollected += newInRound;
+                updateStatus(`扫描中... 第 ${rounds} 轮 +${newInRound} 条 (累计 ${totalCollected})`);
+                debug(`扫描第 ${rounds} 轮: 当前DOM ${currentRows.length} 行, 新增 ${newInRound}, 累计 ${totalCollected}`);
+
+                // 向下滚动
+                const beforeScroll = scroller.scrollTop;
+                scroller.scrollTop += scrollStep;
+                await sleep(350); // 等待虚拟滚动渲染
+
+                // 检测是否到底（scrollTop 没变或接近底部）
+                if (scroller.scrollTop === beforeScroll || scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10) {
+                    stagnantCount++;
+                    if (stagnantCount >= 2) {
+                        // 再采一轮底部内容
+                        const finalRows = getAllCategoryRows(container);
+                        for (const rowInfo of finalRows) {
+                            if (!rowInfo.name) continue;
+                            const info = buildPathForRow(rowInfo, finalRows);
+                            if (info && !seenPaths.has(info.path)) {
+                                seenPaths.add(info.path);
+                                collectedData.push(info);
+                                totalCollected++;
+                            }
+                        }
+                        debug('到达底部，扫描结束');
+                        break;
+                    }
+                } else {
+                    stagnantCount = 0;
+                }
+
+                lastScrollTop = scroller.scrollTop;
+            }
+        } else {
+            // ===== 普通列表：一次性采集 =====
+            const rows = getAllCategoryRows(container);
+            for (const rowInfo of rows) {
+                if (!rowInfo.name) continue;
+                const info = buildPathForRow(rowInfo, rows);
+                if (info && !seenPaths.has(info.path)) {
+                    seenPaths.add(info.path);
+                    collectedData.push(info);
+                    totalCollected++;
+                }
             }
         }
 
-        updateStatus(`已扫描 ${collectedData.length} 条类目 ✓`);
+        scanInProgress = false;
+        updateStatus(`已扫描 ${totalCollected} 条类目 ✓`);
         renderResults();
-        log(`全量扫描完成: ${collectedData.length} 条`);
+        log(`全量扫描完成: ${totalCollected} 条 (共 ${rounds} 轮)`);
     }
 
     // ==================== 点击追踪处理 ====================
@@ -531,7 +611,7 @@
                 `| ${i + 1} | ${d.l1 || '-'} | ${d.l2 || '-'} | ${d.l3 || '-'} | ${d.name || '-'} |`
             ),
             '',
-            '*Generated by Ozon Category Collector v5.2*',
+            '*Generated by Ozon Category Collector v5.3*',
         ];
         const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
@@ -693,7 +773,7 @@
         const root = document.createElement('div');
         root.id = 'ozon-fab-root';
         root.innerHTML = `
-            <button id="ozon-fab" title="Ozon 类目采集器 v5.2">
+            <button id="ozon-fab" title="Ozon 类目采集器 v5.3">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
                 <span id="ozon-fab-badge"></span>
@@ -704,7 +784,7 @@
                     <div class="ozon-header-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>Ozon 类目采集器 v5.2</span>
+                        <span>Ozon 类目采集器 v5.3</span>
                     </div>
                     <button id="ozon-btn-collapse" title="收起">▾</button>
                 </div>
@@ -838,7 +918,7 @@
         // 启动
         startClickTracker();
         fab.classList.add('tracking');
-        log('Ozon 类目采集器 v5.2 加载完成');
+        log('Ozon 类目采集器 v5.3 加载完成');
     }
 
     function startClickTracker() {
