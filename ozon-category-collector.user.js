@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon 类目批量采集器
 // @namespace    http://tampermonkey.net/
-// @version      5.5
-// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。v5.5 点击追踪改用当前DOM快照向上查找父级，避免持久化栈被虚拟滚动片段污染。
+// @version      5.6
+// @description  基于 Ozon 卖家后台真实 DOM 结构重写的类目采集器。v5.6 新增自动点击采集模块，模拟鼠标逐行点击+自动滚动。
 // @author       You
 // @match        https://seller.ozon.ru/*
 // @grant        none
@@ -29,6 +29,7 @@
     let clickTrackerActive = false;
     let treeContainerRef = null;
     let autoDetectTimer = null;
+    let autoClickAbort = false; // 自动点击终止标志
 
     // ==================== 黑名单 ====================
     const BLACKLIST = new Set([
@@ -550,6 +551,139 @@
         log(`全量扫描完成: ${totalCollected} 条 (共 ${rounds} 轮)`);
     }
 
+    // ==================== 自动点击采集（模拟鼠标）====================
+
+    let autoClickInProgress = false;
+
+    /**
+     * 自动点击采集：模拟鼠标逐行点击类目 + 自动滚动
+     * 与全量扫描的区别：本模块 dispatch 真实的 click 事件到每行的 button，
+     * 让 Ozon 的 checkbox 也被勾选，同时采集数据。
+     */
+    async function autoCollectCategories() {
+        const container = treeContainerRef || findTreeContainer();
+        if (!container) {
+            alert('未找到类目树！请先打开「类目」筛选弹窗。');
+            return;
+        }
+        if (autoClickInProgress) {
+            alert('正在自动采集中，请点击「停止」结束。');
+            return;
+        }
+
+        autoClickInProgress = true;
+        autoClickAbort = false;
+        forceAddMode = true;
+        clearAll();
+        updateStatus('自动采集中...');
+
+        // 更新按钮状态
+        const startBtn = document.getElementById('ozon-btn-auto-click');
+        const stopBtn = document.getElementById('ozon-btn-auto-stop');
+        if (startBtn) startBtn.style.display = 'none';
+        if (stopBtn) stopBtn.style.display = '';
+
+        const scroller = container.scrollTop !== undefined ? container : container.querySelector('[class*="-a2"]') || container;
+
+        // 滚到顶部
+        scroller.scrollTop = 0;
+        await sleep(500);
+
+        const seenNames = new Set();
+        let round = 0;
+        const maxRounds = 300;
+        const clickDelay = 120; // 每次点击间隔(ms)，太快会被 Ozon 限流
+        const scrollPause = 600; // 滚动后等待 DOM 渲染(ms)
+        let stagnantCount = 0;
+
+        log('开始自动点击采集...');
+
+        while (round < maxRounds && !autoClickAbort) {
+            round++;
+            const currentRows = getAllCategoryRows(container);
+            let newCount = 0;
+
+            for (const rowInfo of currentRows) {
+                if (autoClickAbort) break;
+                if (!rowInfo.name || rowInfo.level < 0) continue;
+                if (seenNames.has(rowInfo.name)) continue;
+
+                // 确保行可见（滚动到视口内）
+                const btn = rowInfo.button;
+                btn.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+                await sleep(30);
+
+                // 模拟鼠标点击：dispatch mousedown + mouseup + click 到 button
+                const btnRect = btn.getBoundingClientRect();
+                const centerX = btnRect.left + btnRect.width / 2;
+                const centerY = btnRect.top + btnRect.height / 2;
+
+                ['mousedown', 'mouseup', 'click'].forEach(eventType => {
+                    btn.dispatchEvent(new MouseEvent(eventType, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: centerX,
+                        clientY: centerY,
+                        button: 0,
+                    }));
+                });
+
+                seenNames.add(rowInfo.name);
+                newCount++;
+                flashRow(rowInfo.element, '#7b1fa2');
+
+                if (clickDelay > 0) await sleep(clickDelay);
+            }
+
+            updateStatus(`自动采集中... 第 ${round} 轮 +${newCount} 条 (累计 ${collectedData.length})`);
+            renderResults();
+
+            // 向下滚动
+            const scrollStep = Math.max(150, Math.floor(scroller.clientHeight * 0.5));
+            const beforeScroll = scroller.scrollTop;
+            scroller.scrollTop += scrollStep;
+            await sleep(scrollPause);
+
+            // 到底检测
+            if (scroller.scrollTop === beforeScroll || scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10) {
+                stagnantCount++;
+                if (stagnantCount >= 3) {
+                    // 最终扫描底部残留
+                    const finalRows = getAllCategoryRows(container);
+                    for (const rowInfo of finalRows) {
+                        if (autoClickAbort) break;
+                        if (!rowInfo.name || rowInfo.level < 0 || seenNames.has(rowInfo.name)) continue;
+                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        seenNames.add(rowInfo.name);
+                    }
+                    renderResults();
+                    log('到达底部，自动采集结束');
+                    break;
+                }
+            } else {
+                stagnantCount = 0;
+            }
+        }
+
+        // 恢复状态
+        forceAddMode = false;
+        autoClickInProgress = false;
+        if (startBtn) startBtn.style.display = '';
+        if (stopBtn) stopBtn.style.display = 'none';
+
+        const total = collectedData.length;
+        updateStatus(autoClickAbort ? `自动采集已停止 — 共 ${total} 条` : `自动采集完成 ✓ 共 ${total} 条`);
+        renderResults();
+        log(`自动点击采集完成: ${total} 条 (共 ${round} 轮)`);
+    }
+
+    /** 停止自动点击采集 */
+    function stopAutoCollect() {
+        autoClickAbort = true;
+        log('正在停止自动采集...');
+    }
+
     // ==================== 点击追踪处理 ====================
 
     function onTreeClick(e) {
@@ -579,7 +713,17 @@
         const info = buildPathForClick(currentRowInfo, allRows);
         if (!info) return;
 
-        // 用 path 字符串去重/移除（不依赖 element 引用，避免 DOM 变化导致重复）
+        // 如果是自动模式，直接添加（不 toggle）
+        if (forceAddMode) {
+            const dup = collectedData.findIndex(d => d.path === info.path);
+            if (dup < 0) {
+                collectedData.push(info);
+                flashRow(row, '#7b1fa2');
+            }
+            return; // 自动模式下不更新UI（批量更新）
+        }
+
+        // 手动模式：用 path 字符串去重/移除（不依赖 element 引用，避免 DOM 变化导致重复）
         const existingIndex = collectedData.findIndex(d => d.path === info.path);
         if (existingIndex >= 0) {
             collectedData.splice(existingIndex, 1);
@@ -594,6 +738,8 @@
         updateStatus(`已追踪 ${collectedData.length} 条类目`);
         renderResults();
     }
+
+    let forceAddMode = false; // 自动点击采集时为 true
 
     function flashRow(rowEl, color) {
         if (!rowEl) return;
@@ -847,7 +993,7 @@
         const root = document.createElement('div');
         root.id = 'ozon-fab-root';
         root.innerHTML = `
-            <button id="ozon-fab" title="Ozon 类目采集器 v5.5">
+            <button id="ozon-fab" title="Ozon 类目采集器 v5.6">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
                 <span id="ozon-fab-badge"></span>
@@ -858,7 +1004,7 @@
                     <div class="ozon-header-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>Ozon 类目采集器 v5.5</span>
+                        <span>Ozon 类目采集器 v5.6</span>
                     </div>
                     <button id="ozon-btn-collapse" title="收起">▾</button>
                 </div>
@@ -866,11 +1012,21 @@
                     <div id="ozon-mode-hint">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-                        <span>支持点击逐个采集 + 一键全量扫描（基于 Ozon DOM --level 层级）</span>
+                        <span>支持自动点击采集 + 手动逐个点击 + 全量扫描（基于 Ozon DOM --level 层级）</span>
                     </div>
 
                     <div id="ozon-panel-buttons">
-                        <button id="ozon-btn-scan-all" class="ob-purple" title="自动扫描弹窗内所有已加载的类目">
+                        <button id="ozon-btn-auto-click" class="ob-green" title="自动模拟鼠标点击每个类目行并采集（含自动滚动）">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <path d="M5 3l14 9-14 9V3z"/></svg>
+                            自动点击
+                        </button>
+                        <button id="ozon-btn-auto-stop" class="ob-red" title="停止自动点击" style="display:none;">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                            停止
+                        </button>
+                        <button id="ozon-btn-scan-all" class="ob-purple" title="自动扫描弹窗内所有已加载的类目（不点击，仅读取DOM）">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                                 <path d="M21 21l-6-6m2-5a7 7 0 1 1-14 0 7 7 0 0 1 14 0z"/></svg>
                             全量扫描
@@ -938,6 +1094,8 @@
         };
 
         document.getElementById('ozon-btn-scan-all').onclick = scanAllCategories;
+        document.getElementById('ozon-btn-auto-click').onclick = autoCollectCategories;
+        document.getElementById('ozon-btn-auto-stop').onclick = stopAutoCollect;
         document.getElementById('ozon-btn-download-csv').onclick = downloadCSV;
         document.getElementById('ozon-btn-download-md').onclick = downloadMD;
         document.getElementById('ozon-btn-clear').onclick = clearAll;
@@ -992,7 +1150,7 @@
         // 启动
         startClickTracker();
         fab.classList.add('tracking');
-        log('Ozon 类目采集器 v5.5 加载完成');
+        log('Ozon 类目采集器 v5.6 加载完成');
     }
 
     function startClickTracker() {
